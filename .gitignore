@@ -1,0 +1,50 @@
+# Local authentication and credentials
+.auth.json*
+.tokens.json*
+.node-secret*
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+*credentials*.json
+*secrets*.json
+
+# Personal VPN launcher (contains deployment credentials)
+/start-easyconnect.sh
+
+# Runtime reports, transfers, and logs
+/pages/
+/uploads/
+*.log
+*.log.*
+*.pid
+*.sock
+*.sqlite*
+*.db
+*.bak
+*.orig
+*.swp
+
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Editor and machine-local configuration
+.idea/
+.vscode/
+.DS_Store
+.agents/
+.codex/
