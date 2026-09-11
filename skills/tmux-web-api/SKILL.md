@@ -58,17 +58,19 @@ description: 通过 tmux-web CLI 和 HTTP/WebSocket API 管理本机及远程节
 
 ## 新增节点
 
-只有用户任务需要时才部署新节点。节点需要 Linux / Python 3.10+，`node.py` 使用标准库，无需 tmux。通过可信通道复制脚本与节点密钥，密钥文件权限设为 `600`，在节点执行：
+只有用户任务需要时才部署新节点。节点需要 Linux / Python 3.10+，无需 tmux；首次运行自动在用户私有缓存中准备 `noiseprotocol` 依赖（需要包源网络访问和 pip 或 venv/ensurepip）。
+
+用户可在仪表盘 nodes 面板点 **+ add a node** 复制一条命令，自动下载校验脚本并启动；节点名默认使用主机名。不要把含凭据的复制命令贴进日志或聊天回复。已有脚本和密钥文件时：
 
 ```bash
-python3 node.py --server wss://hub.example.com:59999/ws-node \
+python3 node.py --server ws://hub-host:59999/ws-node \
   --token-file "$HOME/.tmux-web-node-secret" --name gpu1
 ```
 
-先更新主服务，使其支持 Bearer 节点认证，并准备 TLS 入口。主服务可同时设置 `TMUX_WEB_TLS_CERT`、`TMUX_WEB_TLS_KEY` 启用 HTTPS/WSS，也可使用已有的 HTTPS 反向代理；域名需与证书匹配。
+默认在现有 WebSocket 内使用 `Noise_NNpsk0_25519_ChaChaPoly_SHA256` 进行双向认证和加密，无需证书、域名或更换端口。节点只发送不含凭据和节点名的 `/ws-node?v=2` 升级请求，Noise 握手后才发送加密的注册信息。控制消息、终端数据和文件传输都受保护，认证失败或数据被篡改时关闭连接，不降级明文。
 
-节点默认要求 `wss://`，最低 TLS 1.2，验证证书链和主机名，认证令牌放在请求头中，不放在 URL 中。私有 CA 使用 `--ca-file /path/to/ca.pem` 或 `TMUX_WEB_CA_FILE`。控制消息、终端数据和文件传输都经过同一 TLS 连接。
+先更新主服务，再更新节点；旧节点兼容通道不会自动获得加密。`wss://` 仍支持作为额外外层 TLS，需要时可用 `--ca-file`，普通 `ws://` 节点连接不需要该配置。`TMUX_WEB_NODE_TOKEN` 和 `--token` 仍受支持，密钥文件方式能避免在命令参数里存放凭据。
 
-节点也支持 `TMUX_WEB_NODE_TOKEN`，文件方式可避免把密钥放在进程参数中。只有显式传入 `--allow-insecure-ws` 才允许 `ws://`，用于本机测试或已有加密隧道；不能因证书报错而自行降级或关闭验证。TLS 不隐藏目标地址、时序和流量大小，不承诺规避网络策略。
+浏览器与普通 HTTP API 不经过节点的 Noise 通道，跨不可信网络仍需 HTTPS。加密不隐藏网络地址、握手、时序和流量大小，不承诺规避网络策略。
 
 主服务重启时节点会自动重连并重新注册现有会话。节点进程退出或机器重启会丢失节点会话；每个节点会话是一个 shell，没有 tmux 的窗口和面板。srun 校园网登录默认关闭，仅在显式配置 `TMUX_WEB_PORTAL_URL`、`TMUX_WEB_PORTAL_USER`、`TMUX_WEB_PORTAL_PASS` 时启用。

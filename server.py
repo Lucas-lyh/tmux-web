@@ -84,6 +84,11 @@ TOKEN_FILE = os.path.join(BASE_DIR, ".tokens.json")
 TOKEN_TTL = 30 * 24 * 3600  # 30 days
 
 
+def node_script_bytes() -> bytes:
+    with open(os.path.join(BASE_DIR, "node.py"), "rb") as source:
+        return source.read()
+
+
 def _hash_pw(salt: str, password: str) -> str:
     return hashlib.sha256((salt + "\x00" + password).encode()).hexdigest()
 
@@ -609,10 +614,9 @@ async function refreshNodes() {
   const box = $('nodes');
   if (!info) { box.innerHTML = ''; return; }
   box.innerHTML = info.nodes.map(n =>
-    `<div class="nodeitem">&#128421; ${esc(n.name)}<span class="meta">${n.sessions} sess</span>` +
+    `<div class="nodeitem">&#128421; ${esc(n.name)}<span class="meta">${n.encrypted ? '🔒 ' : ''}${n.sessions} sess</span>` +
     `<button class="ghost nodesess" data-node="${esc(n.name)}" title="new session on ${esc(n.name)}">+</button></div>`
-  ).join('') + '<div class="nodecmd nodejoin" title="copy the node.py join command">+ add a node</div>' +
-    '<div class="nodecmd nodekey" title="copy the node authentication key">copy node key</div>';
+  ).join('') + '<div class="nodecmd nodejoin" title="copy a command to download and connect an encrypted node">+ add a node</div>';
   box.querySelectorAll('.nodesess').forEach(b => b.onclick = async () => {
     const name = prompt('Session name on ' + b.dataset.node + ':');
     if (!name || !name.trim()) return;
@@ -622,22 +626,19 @@ async function refreshNodes() {
     else alert(await r.text());
   });
   box.querySelector('.nodejoin').onclick = () => {
-    if (location.protocol !== 'https:') {
-      setStatus('Open the dashboard over HTTPS to copy an encrypted node connection command', 'bad');
-      return;
-    }
-    const cmd = 'python3 node.py --server ' + shellQuote('wss://' + location.host + '/ws-node') +
-                ' --token-file "$HOME/.tmux-web-node-secret" --name <node-name>';
+    const bootstrap = 'import hashlib,os,pathlib,sys,tempfile,urllib.request; ' +
+      'data=urllib.request.urlopen(sys.argv[1],timeout=30).read(); ' +
+      'digest=hashlib.sha256(data).hexdigest(); ' +
+      'digest==sys.argv[2] or sys.exit("node download integrity check failed"); ' +
+      'folder=pathlib.Path(tempfile.mkdtemp(prefix="tmux-web-node-")); ' +
+      'script=folder/"node.py"; script.write_bytes(data); ' +
+      'os.environ["TMUX_WEB_NODE_TOKEN"]=sys.argv[4]; ' +
+      'os.execv(sys.executable,[sys.executable,str(script),"--server",sys.argv[3]]+sys.argv[5:])';
+    const endpoint = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws-node';
+    const cmd = 'python3 -c ' + shellQuote(bootstrap) + ' ' + shellQuote(location.origin + '/node.py') +
+      ' ' + shellQuote(info.node_script_sha256) + ' ' + shellQuote(endpoint) + ' ' + shellQuote(info.secret);
     copyText(cmd);
-    setStatus('node command copied — save the node secret in ~/.tmux-web-node-secret on the node first', 'ok');
-  };
-  box.querySelector('.nodekey').onclick = () => {
-    if (location.protocol !== 'https:') {
-      setStatus('Open the dashboard over HTTPS to copy the node key', 'bad');
-      return;
-    }
-    copyText(info.secret);
-    setStatus('node key copied — save as ~/.tmux-web-node-secret on the node with permissions 600', 'ok');
+    setStatus('connection command copied — run it on the node; encryption is automatic', 'ok');
   };
 }
 
@@ -1909,6 +1910,9 @@ async def process_request(connection, request):
     url = urllib.parse.urlsplit(request.path)
     path, query = url.path, urllib.parse.parse_qs(url.query)
 
+    if path == "/node.py":
+        return http_response(200, node_script_bytes().decode("utf-8"), "text/x-python; charset=utf-8")
+
     if path == "/api/login":
         ip = (connection.remote_address or ("?",))[0]
         if login_blocked(ip):
@@ -1925,6 +1929,12 @@ async def process_request(connection, request):
         return http_response(401, "wrong password\n", "text/plain; charset=utf-8")
 
     if path == "/ws-node":
+        if query.get("v") == ["2"]:
+            # Authenticate inside Noise before registering a node. No secret or
+            # node/session metadata belongs in the unencrypted HTTP handshake.
+            if "name" in query or "token" in query or request.headers.get("Authorization"):
+                return http_response(400, "credentials must be sent inside the encrypted channel\n", "text/plain")
+            return None
         # Child nodes authenticate with the node secret, not the UI cookie.
         if (not node_authed(request, query)
                 or not VALID_NODE.match((query.get("name") or [""])[0])):
@@ -2052,8 +2062,10 @@ async def process_request(connection, request):
     if path == "/api/nodes":
         return http_response(200, json.dumps({
             "secret": node_secret(),
+            "node_script_sha256": hashlib.sha256(node_script_bytes()).hexdigest(),
             "port": PORT,
-            "nodes": [{"name": n, "sessions": len(c.sessions)} for n, c in NODES.items()],
+            "nodes": [{"name": n, "sessions": len(c.sessions),
+                       "encrypted": getattr(c, "encrypted", False)} for n, c in NODES.items()],
         }), "application/json")
 
     if path == "/api/stats":
@@ -2165,6 +2177,8 @@ async def process_request(connection, request):
             if not complete:
                 return http_response(413, "file too large (max 1 GiB)\n",
                                      "text/plain; charset=utf-8")
+            if len(data) != int(meta.get("size", -1)):
+                return http_response(502, "incomplete node file transfer\n", "text/plain; charset=utf-8")
             name = os.path.basename(meta.get("name", "")) or "file"
             return Response(200, http.HTTPStatus(200).phrase, Headers({
                 "Content-Type": "application/octet-stream",
@@ -2354,7 +2368,7 @@ def web_detach(name: str, cid: int) -> None:
 # stream/file data as [kind:1B][id:8B big-endian][payload].
 # ---------------------------------------------------------------------------
 NODE_SECRET_FILE = os.path.join(BASE_DIR, ".node-secret")
-NODE_PROTO_VERSION = 1
+NODE_PROTO_VERSION = 2
 VALID_NODE = re.compile(r"^[\w.\-]{1,32}$", re.UNICODE)
 
 KIND_OUTPUT = 0     # node -> hub: terminal output (id = session id)
@@ -2494,17 +2508,30 @@ async def handle_node_ws(ws) -> None:
     url = urllib.parse.urlsplit(ws.request.path)
     query = urllib.parse.parse_qs(url.query)
     name = (query.get("name") or [""])[0]
-    node = NodeConn(ws, name)
-    NODES[name] = node
+    encrypted = query.get("v") == ["2"]
     try:
+        if encrypted:
+            from node import NoiseChannel
+            ws = await asyncio.wait_for(NoiseChannel.establish(ws, node_secret(), initiator=False), 10)
         raw = await asyncio.wait_for(ws.recv(), 15)
         hello = json.loads(raw) if isinstance(raw, str) else {}
         if hello.get("type") != "hello":
             raise ValueError("expected hello")
+        if encrypted:
+            name = hello.get("name", "")
+            if hello.get("version") != NODE_PROTO_VERSION or not isinstance(name, str) or not VALID_NODE.fullmatch(name):
+                raise ValueError("invalid encrypted node registration")
+        node = NodeConn(ws, name)
+        node.encrypted = encrypted
         for s in hello.get("sessions", []):
             node.sessions[int(s["sid"])] = {
                 "name": str(s.get("name", ""))[:64],
                 "cols": int(s.get("cols", 220)), "rows": int(s.get("rows", 50))}
+    except (ValueError, KeyError, TypeError, ConnectionError, asyncio.TimeoutError):
+        await ws.close(1008, "node authentication failed")
+        return
+    NODES[name] = node
+    try:
         await node.send_json({"type": "hello-ok", "version": NODE_PROTO_VERSION})
         async for msg in ws:
             if isinstance(msg, str):
@@ -2519,7 +2546,7 @@ async def handle_node_ws(ws) -> None:
                     q = node.file_queues.get(rid)
                     if q is not None:
                         await q.put(payload)
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError, ConnectionError):
         pass
     finally:
         if NODES.get(name) is node:

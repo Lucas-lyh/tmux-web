@@ -255,7 +255,9 @@ def create_app(backend):
         result = await backend.process_request(conn, adapted)
         if result is not None:
             return web.Response(status=result.status_code, headers=list(result.headers.raw_items()), body=result.body)
-        socket = web.WebSocketResponse(max_msg_size=0, heartbeat=20)
+        encrypted_node = request.path == '/ws-node' and request.query.get('v') == '2'
+        # aiohttp rejects frames >= this limit; Noise permits exactly 65535.
+        socket = web.WebSocketResponse(max_msg_size=65536 if encrypted_node else 0, heartbeat=20)
         await socket.prepare(request)
         try:
             await backend.handle_ws(WebSocketAdapter(socket, request))

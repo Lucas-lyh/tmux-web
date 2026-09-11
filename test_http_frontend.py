@@ -6,12 +6,13 @@ import secrets
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from aiohttp import web, ClientSession, WSMsgType
 from aiohttp.test_utils import TestServer
 
 import http_frontend as frontend
+import node
 import server
 
 
@@ -159,6 +160,57 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn('bearer-test', server.NODES)
                 with self.assertRaises(Exception):
                     await self.client.ws_connect(url, headers={'Authorization': 'Bearer invalid'})
+            finally:
+                await hub.close()
+
+
+    async def test_noise_node_authenticates_before_registration(self):
+        secret = secrets.token_urlsafe(24)
+        with patch.object(server, 'node_secret', return_value=secret), patch.object(server, 'NODES', {}):
+            hub = TestServer(frontend.create_app(server))
+            await hub.start_server()
+            try:
+                url = str(hub.make_url('/ws-node?v=2')).replace('http://', 'ws://', 1)
+                raw = await node.Ws.connect(url, allow_insecure_ws=True)
+                channel = await node.NoiseChannel.establish(node.WsRaw(raw), secret, initiator=True)
+                self.assertEqual(server.NODES, {})
+                await channel.send(json.dumps({'type': 'hello', 'version': 2,
+                                               'name': 'encrypted-test', 'sessions': []}))
+                self.assertEqual(json.loads(await channel.recv())['type'], 'hello-ok')
+                self.assertIn('encrypted-test', server.NODES)
+                # Exercise maximum-size Noise records through the real aiohttp
+                # parser, whose WebSocket size limit is exclusive.
+                reply = asyncio.get_running_loop().create_future()
+                server.NODES['encrypted-test'].pending[123] = reply
+                large = {'type': 'reply', 'id': 123, 'payload': 'x' * 131072}
+                await channel.send(json.dumps(large))
+                self.assertEqual(await asyncio.wait_for(reply, 3), large)
+                await server.NODES['encrypted-test'].send_json(large)
+                self.assertEqual(json.loads(await channel.recv()), large)
+                await channel.close()
+                await asyncio.sleep(.02)
+                self.assertEqual(server.NODES, {})
+                raw = await node.Ws.connect(url, allow_insecure_ws=True)
+                with self.assertRaises(node.NoiseError):
+                    await node.NoiseChannel.establish(node.WsRaw(raw), secrets.token_urlsafe(24), initiator=True)
+                self.assertEqual(server.NODES, {})
+                with self.assertRaises(Exception):
+                    await self.client.ws_connect(hub.make_url('/ws-node?v=2&token=invalid'))
+            finally:
+                await hub.close()
+
+
+    async def test_truncated_node_download_is_an_error(self):
+        remote = SimpleNamespace(
+            file_get=AsyncMock(return_value=({'ok': True, 'size': 100, 'name': 'data.bin'}, 1, None)),
+            file_collect=AsyncMock(return_value=(b'truncated', True)))
+        with patch.object(server, 'NODES', {'test': remote}), patch.object(server, 'request_authed', return_value=True):
+            hub = TestServer(frontend.create_app(server))
+            await hub.start_server()
+            try:
+                async with self.client.get(hub.make_url('/api/download?node=test&path=/tmp/data.bin')) as response:
+                    self.assertEqual(response.status, 502)
+                    self.assertIn('incomplete', await response.text())
             finally:
                 await hub.close()
 

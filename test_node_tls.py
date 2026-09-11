@@ -254,12 +254,12 @@ class NodeTLSTests(unittest.IsolatedAsyncioTestCase):
                 await node.Ws.connect("wss://localhost/ws-node", token="test\r\nInjected: header")
             connect.assert_not_called()
 
-    async def test_agent_forwards_transport_policy_without_token_in_url(self):
+    async def test_agent_default_transport_keeps_token_and_node_name_out_of_handshake(self):
         token = secrets.token_urlsafe(24)
-        for scheme, insecure in (("wss", False), ("ws", True)):
+        for scheme in ("wss", "ws"):
             with self.subTest(scheme=scheme):
-                agent = node.Agent(f"{scheme}://localhost/ws-node?existing=value", token, "lab 测试",
-                                   ssl_context=self.client_context, allow_insecure_ws=insecure)
+                agent = node.Agent(f"{scheme}://localhost/ws-node?existing=value", token, "private-lab-node",
+                                   ssl_context=self.client_context)
                 with patch.object(node.Ws, "connect", new_callable=AsyncMock,
                                   side_effect=asyncio.CancelledError) as connect:
                     with self.assertRaises(asyncio.CancelledError):
@@ -268,11 +268,12 @@ class NodeTLSTests(unittest.IsolatedAsyncioTestCase):
                     arguments = connect.call_args
                 url = arguments.args[0]
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
-                self.assertEqual(query, {"existing": ["value"], "name": ["lab 测试"]})
+                self.assertEqual(query, {"v": ["2"]})
                 self.assertNotIn(token, url)
-                self.assertEqual(arguments.kwargs["token"], token)
+                self.assertNotIn(agent.name, url)
+                self.assertIsNone(arguments.kwargs.get("token"))
                 self.assertIs(arguments.kwargs["ssl_context"], self.client_context)
-                self.assertEqual(arguments.kwargs["allow_insecure_ws"], insecure)
+                self.assertTrue(arguments.kwargs["allow_insecure_ws"])
 
     async def test_incorrect_websocket_accept_is_rejected(self):
         url, completed = await self.start_peer(bad_accept=True)
@@ -389,7 +390,9 @@ class NodeTLSTests(unittest.IsolatedAsyncioTestCase):
                 raise asyncio.CancelledError
 
         with patch.object(node.Ws, "connect", new_callable=AsyncMock, return_value=connection):
-            with patch.object(agent, "serve", side_effect=serve), \
+            with patch.object(node.NoiseChannel, "establish", new_callable=AsyncMock,
+                              return_value=connection), \
+                    patch.object(agent, "serve", side_effect=serve), \
                     patch.object(agent, "maybe_portal_login", new_callable=AsyncMock), \
                     patch.object(node.asyncio, "sleep", side_effect=record_delay), \
                     patch("builtins.print"):
