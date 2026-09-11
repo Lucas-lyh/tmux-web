@@ -11,13 +11,12 @@ The secret is available through /api/nodes or the web UI's
 "<name>:<session>" and support attach, resize, file up/download and
 capture, just like local tmux sessions.
 
-Dependencies: Python 3.10+ (Unix/Linux). The standalone node installs its
-pinned Noise dependency into a private user cache on first launch if needed.
+Dependencies: Python 3.10+ standard library only (Unix/Linux).
 
 All application messages use Noise_NNpsk0_25519_ChaChaPoly_SHA256 encryption
 and authentication with the existing node secret. No certificate setup is
 required, and neither the secret nor session metadata goes in the URL.
-TLS (wss://) remains an optional additional outer layer.
+The cipher and handshake are built into this file; no package installation.
 Inside encryption, text messages are JSON control messages; binary messages
 are [kind:1B][id:8B big-endian][payload].
 Note: sessions live as long as THIS agent process lives; if the agent (or
@@ -38,9 +37,7 @@ import secrets
 import shutil
 import signal
 import socket
-import ssl
 import struct
-import subprocess
 import sys
 import tempfile
 import time
@@ -52,7 +49,6 @@ PROTO_VERSION = 2
 NOISE_PROTOCOL = b"Noise_NNpsk0_25519_ChaChaPoly_SHA256"
 NOISE_PROLOGUE = b"tmux-web/node/v2"
 NOISE_PSK_CONTEXT = b"tmux-web/node/v2/psk"
-NOISE_DEPENDENCY = "noiseprotocol==0.3.1"
 NOISE_MAX_MESSAGE = 8 * 1024 * 1024
 NOISE_MAX_RECORD = 65535
 NOISE_HEADER = struct.Struct("!BII")  # encrypted kind, total length, offset
@@ -169,6 +165,7 @@ def _xencode(msg, key):
 
 
 def _get_jsonp(url: str, params: dict, insecure: bool = False) -> dict:
+    import ssl  # Existing optional HTTPS campus-portal requests only.
     params = dict(params)
     params["callback"] = cb = "jQuery112406951885120277062_" + str(int(time.time() * 1000))
     req = urllib.request.Request(
@@ -223,78 +220,207 @@ class NoiseError(WsClosed, ConnectionError):
     """Encrypted channel authentication or framing failed; never fall back."""
 
 
-def _noise_class():
-    from noise.connection import NoiseConnection
-    return NoiseConnection
+# Fixed Noise NNpsk0 suite implemented here with standard-library primitives.
+# Algorithms: RFC 7748 section 5, RFC 8439 sections 2.3/2.5/2.8, and Noise rev 34.
+# Python big-integer arithmetic is not guaranteed constant-time. Keep this
+# implementation covered by published vectors and cross-implementation tests.
+
+def _x25519(private: bytes, public: bytes) -> bytes:
+    if len(private) != 32 or len(public) != 32:
+        raise ValueError("invalid X25519 key length")
+    p = 2**255 - 19
+    scalar = (int.from_bytes(private, "little") & ((1 << 255) - 8)) | (1 << 254)
+    u = (int.from_bytes(public, "little") & ((1 << 255) - 1)) % p
+    x2, z2, x3, z3, swap = 1, 0, u, 1, 0
+    for bit in range(254, -1, -1):
+        current = (scalar >> bit) & 1
+        swap ^= current
+        mask = -swap
+        dx, dz = mask & (x2 ^ x3), mask & (z2 ^ z3)
+        x2, x3, z2, z3 = x2 ^ dx, x3 ^ dx, z2 ^ dz, z3 ^ dz
+        swap = current
+        a, b = (x2 + z2) % p, (x2 - z2) % p
+        aa, bb = a * a % p, b * b % p
+        e = (aa - bb) % p
+        c, d = (x3 + z3) % p, (x3 - z3) % p
+        da, cb = d * a % p, c * b % p
+        x3 = (da + cb) ** 2 % p
+        z3 = u * (da - cb) ** 2 % p
+        x2 = aa * bb % p
+        z2 = e * (aa + 121665 * e) % p
+    mask = -swap
+    x2 ^= mask & (x2 ^ x3)
+    z2 ^= mask & (z2 ^ z3)
+    shared = (x2 * pow(z2, p - 2, p) % p).to_bytes(32, "little")
+    if hmac.compare_digest(shared, bytes(32)):
+        raise ValueError("invalid X25519 peer")
+    return shared
 
 
-def ensure_noise_dependency() -> None:
-    """Install only into a private cache, never into the system interpreter."""
-    try:
-        _noise_class()
-        return
-    except ImportError:
-        pass
-    import fcntl
-    import importlib
-    import venv
+def _chacha_block(key: bytes, counter: int, nonce: bytes) -> bytes:
+    if len(key) != 32 or len(nonce) != 12 or not 0 <= counter < 2**32:
+        raise ValueError("invalid ChaCha20 parameters")
+    initial = list(struct.unpack("<4I", b"expand 32-byte k"))
+    initial += list(struct.unpack("<8I", key)) + [counter] + list(struct.unpack("<3I", nonce))
+    state = initial.copy()
+    def quarter(a, b, c, d):
+        state[a] = (state[a] + state[b]) & 0xffffffff
+        value = state[d] ^ state[a]
+        state[d] = ((value << 16) | (value >> 16)) & 0xffffffff
+        state[c] = (state[c] + state[d]) & 0xffffffff
+        value = state[b] ^ state[c]
+        state[b] = ((value << 12) | (value >> 20)) & 0xffffffff
+        state[a] = (state[a] + state[b]) & 0xffffffff
+        value = state[d] ^ state[a]
+        state[d] = ((value << 8) | (value >> 24)) & 0xffffffff
+        state[c] = (state[c] + state[d]) & 0xffffffff
+        value = state[b] ^ state[c]
+        state[b] = ((value << 7) | (value >> 25)) & 0xffffffff
+    for _ in range(10):
+        quarter(0, 4, 8, 12); quarter(1, 5, 9, 13)
+        quarter(2, 6, 10, 14); quarter(3, 7, 11, 15)
+        quarter(0, 5, 10, 15); quarter(1, 6, 11, 12)
+        quarter(2, 7, 8, 13); quarter(3, 4, 9, 14)
+    return struct.pack("<16I", *[(a + b) & 0xffffffff for a, b in zip(state, initial)])
 
-    cache_base = os.path.expanduser("~/.cache/tmux-web")
-    os.makedirs(cache_base, mode=0o700, exist_ok=True)
-    if os.path.islink(cache_base) or os.stat(cache_base).st_uid != os.getuid():
-        raise RuntimeError("encrypted transport cache must be a private directory owned by this user")
-    os.chmod(cache_base, 0o700)
-    cache = os.path.join(cache_base, "noiseprotocol-0.3.1-" + sys.implementation.cache_tag)
-    lock_fd = os.open(os.path.join(cache_base, ".noise-install.lock"),
-                      os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(lock_fd, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        if os.path.islink(cache):
-            raise RuntimeError("encrypted transport cache must not be a symbolic link")
 
-        def load_cache():
-            # A failed import can leave the namespace package in sys.modules.
-            for name in list(sys.modules):
-                if name == "noise" or name.startswith("noise."):
-                    sys.modules.pop(name, None)
-            if cache not in sys.path:
-                sys.path.insert(0, cache)
-            importlib.invalidate_caches()
-            return _noise_class()
+def _chacha_xor(key: bytes, nonce: bytes, data: bytes) -> bytes:
+    output = bytearray(len(data))
+    for offset in range(0, len(data), 64):
+        stream = _chacha_block(key, 1 + offset // 64, nonce)
+        chunk = data[offset:offset + 64]
+        # Integer XOR avoids one Python operation per byte of payload.
+        output[offset:offset + len(chunk)] = (int.from_bytes(chunk, "little") ^
+            int.from_bytes(stream[:len(chunk)], "little")).to_bytes(len(chunk), "little")
+    return bytes(output)
 
-        if os.path.isdir(cache):
-            try:
-                load_cache()
-                return
-            except ImportError:
-                # Only this versioned private dependency cache is replaced.
-                shutil.rmtree(cache)
-        print("[node] preparing encrypted transport dependency (first launch) ...", file=sys.stderr)
-        with tempfile.TemporaryDirectory(prefix=".noise-install-", dir=cache_base) as work:
-            installer = sys.executable
-            probe = subprocess.run([installer, "-m", "pip", "--version"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if probe.returncode:
-                try:
-                    venv_path = os.path.join(work, "installer")
-                    venv.EnvBuilder(with_pip=True).create(venv_path)
-                    installer = os.path.join(venv_path, "bin", "python")
-                except Exception:
-                    raise RuntimeError("automatic encrypted transport setup requires Python pip or venv/ensurepip") from None
-            target = os.path.join(work, "packages")
-            # pip may include credential-bearing index URLs in diagnostics;
-            # suppress subprocess output and report only a fixed failure.
-            result = subprocess.run([
-                installer, "-m", "pip", "install", "--disable-pip-version-check",
-                "--no-input", "--quiet", "--target", target, NOISE_DEPENDENCY,
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if result.returncode:
-                raise RuntimeError("automatic encrypted transport dependency download failed; check package network access")
-            os.replace(target, cache)
-        try:
-            load_cache()
-        except ImportError:
-            raise RuntimeError("encrypted transport dependency could not be loaded") from None
+
+def _poly1305(key: bytes, message: bytes) -> bytes:
+    if len(key) != 32:
+        raise ValueError("invalid Poly1305 key length")
+    r = int.from_bytes(key[:16], "little") & 0x0ffffffc0ffffffc0ffffffc0fffffff
+    s = int.from_bytes(key[16:], "little")
+    accumulator = 0
+    for offset in range(0, len(message), 16):
+        block = message[offset:offset + 16]
+        accumulator = ((accumulator + int.from_bytes(block + b"\x01", "little")) * r) % (2**130 - 5)
+    return ((accumulator + s) & (2**128 - 1)).to_bytes(16, "little")
+
+
+def _aead_tag(key: bytes, nonce: bytes, ad: bytes, ciphertext: bytes) -> bytes:
+    mac_data = (ad + bytes((-len(ad)) % 16) + ciphertext + bytes((-len(ciphertext)) % 16)
+                + struct.pack("<QQ", len(ad), len(ciphertext)))
+    return _poly1305(_chacha_block(key, 0, nonce)[:32], mac_data)
+
+
+class _Cipher:
+    def __init__(self, key: bytes):
+        self.key, self.nonce = key, 0
+
+    def _nonce_bytes(self):
+        if not 0 <= self.nonce < 2**64 - 1:
+            raise ValueError("cipher nonce exhausted")
+        return bytes(4) + self.nonce.to_bytes(8, "little")
+
+    def encrypt(self, ad: bytes, plaintext: bytes) -> bytes:
+        nonce = self._nonce_bytes()
+        ciphertext = _chacha_xor(self.key, nonce, plaintext)
+        result = ciphertext + _aead_tag(self.key, nonce, ad, ciphertext)
+        self.nonce += 1
+        return result
+
+    def decrypt(self, ad: bytes, data: bytes) -> bytes:
+        nonce = self._nonce_bytes()
+        if len(data) < 16 or not hmac.compare_digest(data[-16:], _aead_tag(self.key, nonce, ad, data[:-16])):
+            raise ValueError("cipher authentication failed")
+        plaintext = _chacha_xor(self.key, nonce, data[:-16])
+        self.nonce += 1
+        return plaintext
+
+
+def _hkdf(key: bytes, data: bytes, count: int = 2):
+    extracted = hmac.digest(key, data, "sha256")
+    result, previous = [], b""
+    for index in range(1, count + 1):
+        previous = hmac.digest(extracted, previous + bytes([index]), "sha256")
+        result.append(previous)
+    return result
+
+
+class _Noise:
+    """Only the NNpsk0/25519/ChaChaPoly/SHA256 suite; no negotiation/downgrade."""
+    def __init__(self, psk: bytes, initiator: bool, *, ephemeral: bytes | None = None):
+        if len(psk) != 32:
+            raise ValueError("Noise requires a 32-byte PSK")
+        self.initiator = initiator
+        self.h = hashlib.sha256(NOISE_PROTOCOL).digest() if len(NOISE_PROTOCOL) > 32 else NOISE_PROTOCOL.ljust(32, b"\0")
+        self.ck = self.h
+        self._mix_hash(NOISE_PROLOGUE)
+        self.ck, hashed, key = _hkdf(self.ck, psk, 3)
+        self._mix_hash(hashed)
+        self.cipher = _Cipher(key)
+        self.private = secrets.token_bytes(32) if ephemeral is None else ephemeral
+        self.public = _x25519(self.private, b"\x09" + bytes(31))
+        self.remote = None
+        self.step = 0
+        self.handshake_finished = False
+        self.tx = self.rx = None
+
+    def _mix_hash(self, data):
+        self.h = hashlib.sha256(self.h + data).digest()
+
+    def _mix_key(self, data):
+        self.ck, key = _hkdf(self.ck, data)
+        self.cipher = _Cipher(key)
+
+    def _ephemeral(self, public):
+        self._mix_hash(public)
+        self._mix_key(public)  # Required for every e token in a PSK pattern.
+
+    def _finish(self):
+        first, second = _hkdf(self.ck, b"")
+        self.tx, self.rx = (_Cipher(first), _Cipher(second)) if self.initiator else (_Cipher(second), _Cipher(first))
+        self.handshake_finished = True
+        self.private = self.cipher = self.ck = None
+
+    def write_message(self, payload: bytes = b"") -> bytes:
+        if self.handshake_finished or self.step != (0 if self.initiator else 1):
+            raise ValueError("unexpected Noise handshake write")
+        if len(payload) > 65535 - 48:
+            raise ValueError("Noise handshake too large")
+        self._ephemeral(self.public)
+        if self.step == 1:
+            self._mix_key(_x25519(self.private, self.remote))
+        encrypted = self.cipher.encrypt(self.h, payload)
+        self._mix_hash(encrypted)
+        self.step += 1
+        if self.step == 2:
+            self._finish()
+        return self.public + encrypted
+
+    def read_message(self, data: bytes) -> bytes:
+        if self.handshake_finished or self.step != (1 if self.initiator else 0) or not 48 <= len(data) <= 65535:
+            raise ValueError("unexpected Noise handshake read")
+        self.remote = data[:32]
+        self._ephemeral(self.remote)
+        if self.step == 1:
+            self._mix_key(_x25519(self.private, self.remote))
+        payload = self.cipher.decrypt(self.h, data[32:])
+        self._mix_hash(data[32:])
+        self.step += 1
+        if self.step == 2:
+            self._finish()
+        return payload
+
+    def encrypt(self, data: bytes) -> bytes:
+        if not self.handshake_finished or len(data) > 65519:
+            raise ValueError("invalid Noise transport write")
+        return self.tx.encrypt(b"", data)
+
+    def decrypt(self, data: bytes) -> bytes:
+        if not self.handshake_finished or not 16 <= len(data) <= 65535:
+            raise ValueError("invalid Noise transport read")
+        return self.rx.decrypt(b"", data)
 
 
 class NoiseChannel:
@@ -317,15 +443,8 @@ class NoiseChannel:
         channel = cls(raw, None)
         try:
             validate_node_token(token)
-            channel.noise = noise = _noise_class().from_name(NOISE_PROTOCOL)
-            noise.set_prologue(NOISE_PROLOGUE)
-            noise.set_psks(psk=hmac.new(token.encode("utf-8"),
-                                      NOISE_PSK_CONTEXT, hashlib.sha256).digest())
-            if initiator:
-                noise.set_as_initiator()
-            else:
-                noise.set_as_responder()
-            noise.start_handshake()
+            psk = hmac.digest(token.encode("utf-8"), NOISE_PSK_CONTEXT, "sha256")
+            channel.noise = noise = _Noise(psk, initiator)
 
             async def handshake():
                 if initiator:
@@ -379,6 +498,7 @@ class NoiseChannel:
                 for offset in range(0, max(1, len(payload)), NOISE_CHUNK):
                     clear = NOISE_HEADER.pack(kind, len(payload), offset) + payload[offset:offset + NOISE_CHUNK]
                     await self.raw.send(bytes(self.noise.encrypt(clear)))
+                    await asyncio.sleep(0)  # Keep heartbeats responsive during pure-Python encryption.
             except asyncio.CancelledError:
                 await self.close(1008)
                 raise
@@ -411,6 +531,7 @@ class NoiseChannel:
                     payload.extend(chunk)
                     if len(payload) == total:
                         return payload.decode("utf-8") if kind == 1 else bytes(payload)
+                    await asyncio.sleep(0)
             except asyncio.CancelledError:
                 # A cancelled read may have consumed part of a message. The
                 # connection must not continue with lost reassembly state.
@@ -429,7 +550,7 @@ class NoiseChannel:
         return await self.recv()
 
 
-def validate_server_url(url: str, *, allow_insecure_ws: bool = False):
+def validate_server_url(url: str):
     """Validate before urlsplit can discard characters or build HTTP headers."""
     if (not isinstance(url, str) or not url or not url.isascii()
             or any(ord(c) <= 32 or ord(c) == 127 for c in url)
@@ -441,10 +562,8 @@ def validate_server_url(url: str, *, allow_insecure_ws: bool = False):
         hostname, port = u.hostname, u.port
     except ValueError:
         raise ValueError("invalid server URL or port") from None
-    if u.scheme not in ("ws", "wss") or not hostname:
-        raise ValueError("server URL must use wss:// with a hostname")
-    if u.scheme == "ws" and not allow_insecure_ws:
-        raise ValueError("unencrypted ws:// is disabled; use wss:// (or explicitly --allow-insecure-ws)")
+    if u.scheme != "ws" or not hostname:
+        raise ValueError("server URL must use ws:// with a hostname; encryption is built in")
     if u.username is not None or u.password is not None:
         raise ValueError("server URL must not contain credentials")
     if (not re.fullmatch(r"[A-Za-z0-9._:-]+", hostname)
@@ -465,12 +584,6 @@ def validate_node_token(token: str) -> None:
         raise ValueError("node token must be a non-empty ASCII token without whitespace")
 
 
-def node_ssl_context(ca_file: str | None = None) -> ssl.SSLContext:
-    ctx = ssl.create_default_context(cafile=ca_file)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    return ctx
-
-
 async def _close_writer(writer) -> None:
     writer.close()
     with contextlib.suppress(ConnectionError, OSError, asyncio.TimeoutError):
@@ -478,7 +591,7 @@ async def _close_writer(writer) -> None:
 
 
 class Ws:
-    """Minimal RFC6455 client with verified TLS, masking and no extensions."""
+    """Minimal RFC6455 transport; NodeConnection encrypts all application data."""
 
     def __init__(self, reader, writer):
         self.r = reader
@@ -489,39 +602,25 @@ class Ws:
         self.last_seen = time.time()
 
     @classmethod
-    async def connect(cls, url: str, *, token: str | None = None,
-                      ssl_context: ssl.SSLContext | None = None,
-                      allow_insecure_ws: bool = False) -> "Ws":
-        u = validate_server_url(url, allow_insecure_ws=allow_insecure_ws)
-        if token is not None:
-            validate_node_token(token)
-        tls = u.scheme == "wss"
-        port = u.port or (443 if tls else 80)
-        options = {}
-        if tls:
-            ctx = ssl_context if ssl_context is not None else node_ssl_context()
-            if (not ctx.check_hostname or ctx.verify_mode != ssl.CERT_REQUIRED
-                    or ctx.minimum_version < ssl.TLSVersion.TLSv1_2):
-                raise ValueError("node TLS requires hostname/certificate verification and TLS 1.2 or newer")
-            options = {"ssl": ctx, "server_hostname": u.hostname,
-                       "ssl_handshake_timeout": 10}
+    async def connect(cls, url: str) -> "Ws":
+        u = validate_server_url(url)
+        port = u.port or 80
         writer = None
         try:
             try:
                 reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(u.hostname, port, **options), 10)
+                    asyncio.open_connection(u.hostname, port), 10)
             except asyncio.TimeoutError:
-                raise ConnectionError("node TCP/TLS connection timed out") from None
+                raise ConnectionError("node TCP connection timed out") from None
             key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
             path = (u.path or "/") + ("?" + u.query if u.query else "")
             host = f"[{u.hostname}]" if ":" in u.hostname else u.hostname
             if u.port is not None:
                 host += f":{port}"
-            auth = f"Authorization: Bearer {token}\r\n" if token is not None else ""
             writer.write((
                 f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
                 f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
-                f"Sec-WebSocket-Version: 13\r\n{auth}\r\n").encode("ascii"))
+                f"Sec-WebSocket-Version: 13\r\n\r\n").encode("ascii"))
             await writer.drain()
             try:
                 resp = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 15)
@@ -788,18 +887,14 @@ class Session:
 class Agent:
     def __init__(self, server: str, token: str, name: str,
                  portal_user: str = "", portal_pass: str = "",
-                 portal_url: str = "", portal_insecure: bool = False, *,
-                 ssl_context: ssl.SSLContext | None = None,
-                 allow_insecure_ws: bool = True):
-        endpoint = validate_server_url(server, allow_insecure_ws=True)
+                 portal_url: str = "", portal_insecure: bool = False):
+        endpoint = validate_server_url(server)
         validate_node_token(token)
         self.server = server
         self.node_url = urllib.parse.urlunsplit(
             endpoint._replace(query="v=2"))
         self.token = token
         self.name = name
-        self.ssl_context = ssl_context
-        self.allow_insecure_ws = True  # The outer WebSocket always carries Noise.
         self._hello_received = False
         self.portal_user = portal_user
         self.portal_pass = portal_pass
@@ -848,17 +943,10 @@ class Agent:
             try:
                 print(f"[node] connecting to {urllib.parse.urlsplit(self.server).hostname} as {self.name!r} ...")
                 raw_ws = await asyncio.wait_for(Ws.connect(
-                    self.node_url, ssl_context=self.ssl_context,
-                    allow_insecure_ws=True), 25)
+                    self.node_url), 25)
                 channel = await NoiseChannel.establish(WsRaw(raw_ws), self.token, initiator=True)
                 self.ws = NodeConnection(raw_ws, channel)
                 await self.serve()
-            except ssl.SSLCertVerificationError:
-                print("[node] TLS certificate verification failed; check the server hostname, certificate chain or --ca-file")
-                await self.maybe_portal_login()
-            except ssl.SSLError:
-                print("[node] TLS handshake/connection failed; check the server TLS configuration")
-                await self.maybe_portal_login()
             except (WsClosed, ConnectionError, OSError, asyncio.TimeoutError,
                     asyncio.IncompleteReadError) as e:
                 print(f"[node] link down: {type(e).__name__}")
@@ -1109,10 +1197,6 @@ async def main() -> None:
     ap = argparse.ArgumentParser(description="tmux-web child node (no tmux required)")
     ap.add_argument("--server", required=True,
                     help="node endpoint, e.g. ws://host:59999/ws-node (always Noise encrypted)")
-    ap.add_argument("--ca-file", default=os.environ.get("TMUX_WEB_CA_FILE") or None,
-                    help="PEM CA bundle for server verification (or TMUX_WEB_CA_FILE)")
-    ap.add_argument("--allow-insecure-ws", action="store_true",
-                    help=argparse.SUPPRESS)  # Accepted for old commands; Noise is mandatory.
     credentials = ap.add_mutually_exclusive_group()
     credentials.add_argument("--token", help="the server's node secret")
     credentials.add_argument("--token-file", help="read the node secret from this file")
@@ -1139,17 +1223,10 @@ async def main() -> None:
     if not args.token:
         ap.error("provide --token-file, --token or set TMUX_WEB_NODE_TOKEN")
     try:
-        endpoint = validate_server_url(args.server, allow_insecure_ws=True)
+        validate_server_url(args.server)
         validate_node_token(args.token)
     except ValueError as e:
         ap.error(str(e))
-    tls_context = None
-    if endpoint.scheme == "wss":
-        try:
-            tls_context = node_ssl_context(
-                os.path.expanduser(args.ca_file) if args.ca_file else None)
-        except (OSError, ValueError) as e:
-            ap.error(f"cannot load TLS trust configuration: {type(e).__name__}")
     portal_config = (args.portal_url, args.portal_user, args.portal_pass)
     if any(portal_config) and not all(portal_config):
         ap.error("portal auto-login requires a URL, username and password")
@@ -1159,16 +1236,9 @@ async def main() -> None:
             ap.error("--portal-url must be an http:// or https:// base URL")
         if portal.username or portal.password or portal.query or portal.fragment:
             ap.error("--portal-url must not include credentials, a query or a fragment")
-    try:
-        ensure_noise_dependency()
-    except RuntimeError as e:
-        ap.error(str(e))
-    except Exception as e:
-        ap.error(f"cannot prepare encrypted transport: {type(e).__name__}")
     cleanup_uploads()
     agent = Agent(args.server, args.token, args.name,
-                  args.portal_user, args.portal_pass, args.portal_url, args.portal_insecure,
-                  ssl_context=tls_context)
+                  args.portal_user, args.portal_pass, args.portal_url, args.portal_insecure)
     await agent.run()
 
 

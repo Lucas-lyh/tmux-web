@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tmux-web: a tiny web UI to select and interact with tmux sessions.
 
-Serves on 0.0.0.0:59999; set TMUX_WEB_TLS_CERT and TMUX_WEB_TLS_KEY for HTTPS/WSS.
+Serves on 0.0.0.0:59999; node application encryption is built in.
   GET  /                     -> web UI (xterm.js)
   GET  /api/sessions         -> JSON list of tmux + child-node sessions
   GET  /api/new?name=...     -> create session (detached); "node:name" on a node
@@ -40,7 +40,6 @@ import pty
 import re
 import shutil
 import signal
-import ssl
 import struct
 import sys
 import subprocess
@@ -61,19 +60,6 @@ from websockets.http11 import Response
 HOST = os.environ.get("TMUX_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("TMUX_WEB_PORT", "59999"))
 
-
-def tls_context() -> ssl.SSLContext | None:
-    """Enable HTTPS/WSS when both certificate and private key are configured."""
-    cert = os.environ.get("TMUX_WEB_TLS_CERT", "")
-    key = os.environ.get("TMUX_WEB_TLS_KEY", "")
-    if not cert and not key:
-        return None
-    if not cert or not key:
-        raise RuntimeError("Set both TMUX_WEB_TLS_CERT and TMUX_WEB_TLS_KEY to enable TLS.")
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.load_cert_chain(os.path.expanduser(cert), os.path.expanduser(key))
-    return context
 
 # ---------------------------------------------------------------------------
 # Authentication: salted-hash password file + opaque bearer tokens in a cookie.
@@ -633,9 +619,10 @@ async function refreshNodes() {
       'folder=pathlib.Path(tempfile.mkdtemp(prefix="tmux-web-node-")); ' +
       'script=folder/"node.py"; script.write_bytes(data); ' +
       'os.environ["TMUX_WEB_NODE_TOKEN"]=sys.argv[4]; ' +
-      'os.execv(sys.executable,[sys.executable,str(script),"--server",sys.argv[3]]+sys.argv[5:])';
-    const endpoint = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws-node';
-    const cmd = 'python3 -c ' + shellQuote(bootstrap) + ' ' + shellQuote(location.origin + '/node.py') +
+      'os.execv(sys.executable,[sys.executable,"-S",str(script),"--server",sys.argv[3]]+sys.argv[5:])';
+    const base = location.hostname + ':' + info.port;
+    const endpoint = 'ws://' + base + '/ws-node';
+    const cmd = 'python3 -c ' + shellQuote(bootstrap) + ' ' + shellQuote('http://' + base + '/node.py') +
       ' ' + shellQuote(info.node_script_sha256) + ' ' + shellQuote(endpoint) + ' ' + shellQuote(info.secret);
     copyText(cmd);
     setStatus('connection command copied — run it on the node; encryption is automatic', 'ok');
@@ -2917,7 +2904,6 @@ async def handle_ws(ws) -> None:
 
 async def main() -> None:
     global _TOKENS
-    context = tls_context()
     _auth_state()
     _TOKENS = _load_tokens()
     node_secret()
@@ -2928,9 +2914,8 @@ async def main() -> None:
     runner = web.AppRunner(create_app(sys.modules[__name__]))
     await runner.setup()
     try:
-        await web.TCPSite(runner, HOST, PORT, ssl_context=context).start()
-        scheme = "https" if context else "http"
-        print(f"tmux-web listening on {scheme}://{HOST}:{PORT}", flush=True)
+        await web.TCPSite(runner, HOST, PORT).start()
+        print(f"tmux-web listening on http://{HOST}:{PORT}", flush=True)
         await asyncio.Future()
     finally:
         await runner.cleanup()

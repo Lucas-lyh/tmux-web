@@ -171,7 +171,7 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
             await hub.start_server()
             try:
                 url = str(hub.make_url('/ws-node?v=2')).replace('http://', 'ws://', 1)
-                raw = await node.Ws.connect(url, allow_insecure_ws=True)
+                raw = await node.Ws.connect(url)
                 channel = await node.NoiseChannel.establish(node.WsRaw(raw), secret, initiator=True)
                 self.assertEqual(server.NODES, {})
                 await channel.send(json.dumps({'type': 'hello', 'version': 2,
@@ -190,7 +190,7 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
                 await channel.close()
                 await asyncio.sleep(.02)
                 self.assertEqual(server.NODES, {})
-                raw = await node.Ws.connect(url, allow_insecure_ws=True)
+                raw = await node.Ws.connect(url)
                 with self.assertRaises(node.NoiseError):
                     await node.NoiseChannel.establish(node.WsRaw(raw), secrets.token_urlsafe(24), initiator=True)
                 self.assertEqual(server.NODES, {})
