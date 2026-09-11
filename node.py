@@ -11,7 +11,7 @@ The secret is available through /api/nodes or the web UI's
 "<name>:<session>" and support attach, resize, file up/download and
 capture, just like local tmux sessions.
 
-Dependencies: Python 3.10+ standard library only (Unix/Linux).
+Dependencies: Python 3.8+ standard library only (Unix/Linux).
 
 All application messages use Noise_NNpsk0_25519_ChaChaPoly_SHA256 encryption
 and authentication with the existing node secret. No certificate setup is
@@ -22,6 +22,8 @@ are [kind:1B][id:8B big-endian][payload].
 Note: sessions live as long as THIS agent process lives; if the agent (or
 the machine) dies, its sessions are gone.
 """
+
+from __future__ import annotations
 
 import argparse
 import asyncio

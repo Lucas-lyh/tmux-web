@@ -100,13 +100,18 @@ class StandardLibraryCryptoTests(unittest.TestCase):
                 modules = [(item.module or '').split('.')[0]]
             else:
                 continue
-            self.assertTrue(all(name in sys.stdlib_module_names for name in modules), modules)
+            if hasattr(sys, 'stdlib_module_names'):
+                self.assertTrue(all(name in sys.stdlib_module_names for name in modules), modules)
         self.assertNotIn('ensure_noise_dependency', source)
         self.assertNotIn('subprocess', source)
         result = subprocess.run([sys.executable, '-S', node.__file__, '--help'], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0)
         self.assertNotIn('--ca-file', result.stdout)
         self.assertNotIn('--allow-insecure-ws', result.stdout)
+
+    def test_annotations_do_not_require_python310_at_import(self):
+        self.assertIsInstance(node._Noise.__init__.__annotations__['ephemeral'], str)
+        ast.parse(Path(node.__file__).read_text(), feature_version=(3, 8))
 
 
 if __name__ == '__main__':
