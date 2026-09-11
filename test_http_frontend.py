@@ -2,6 +2,7 @@ import asyncio
 import json
 import socket
 import os
+import secrets
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -141,6 +142,25 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('proxy-test', server.NODES)
         finally:
             await hub.close()
+
+
+    async def test_node_bearer_header_authentication(self):
+        secret = secrets.token_urlsafe(24)
+        with patch.object(server, 'node_secret', return_value=secret):
+            hub = TestServer(frontend.create_app(server))
+            await hub.start_server()
+            try:
+                url = hub.make_url('/ws-node?name=bearer-test')
+                async with self.client.ws_connect(url, headers={'Authorization': 'Bearer ' + secret}) as ws:
+                    await ws.send_json({'type': 'hello', 'sessions': []})
+                    self.assertEqual((await ws.receive_json())['type'], 'hello-ok')
+                    self.assertIn('bearer-test', server.NODES)
+                await asyncio.sleep(.02)
+                self.assertNotIn('bearer-test', server.NODES)
+                with self.assertRaises(Exception):
+                    await self.client.ws_connect(url, headers={'Authorization': 'Bearer invalid'})
+            finally:
+                await hub.close()
 
 
 if __name__ == '__main__':

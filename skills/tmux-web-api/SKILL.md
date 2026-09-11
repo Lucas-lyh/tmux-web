@@ -11,6 +11,8 @@ description: 通过 tmux-web CLI 和 HTTP/WebSocket API 管理本机及远程节
 
 `client.py` 读取项目内的 `.node-secret` 作 Bearer 认证；主服务首次成功启动时会生成此文件。服务地址不同则配置 `TMUX_WEB_BASE`，密钥文件在别处则配置 `TMUX_WEB_SECRET`（这是文件路径）。不要输出密钥或把其值写进文档、脚本、网页、聊天回复。
 
+跨网络使用 HTTPS 服务地址；私有 CA 可通过 `SSL_CERT_FILE` 指定。默认的 HTTP 地址用于本机访问，不提供传输加密。
+
 ```bash
 .venv/bin/python client.py sessions
 .venv/bin/python client.py new demo
@@ -59,10 +61,14 @@ description: 通过 tmux-web CLI 和 HTTP/WebSocket API 管理本机及远程节
 只有用户任务需要时才部署新节点。节点需要 Linux / Python 3.10+，`node.py` 使用标准库，无需 tmux。通过可信通道复制脚本与节点密钥，密钥文件权限设为 `600`，在节点执行：
 
 ```bash
-python3 node.py --server ws://hub-host:59999/ws-node \
+python3 node.py --server wss://hub.example.com:59999/ws-node \
   --token-file "$HOME/.tmux-web-node-secret" --name gpu1
 ```
 
-节点也支持 `TMUX_WEB_NODE_TOKEN`，文件方式可避免把密钥放在进程参数中。当前节点仅支持 `ws://`；跨不可信网络使用 VPN 或 SSH 隧道。
+先更新主服务，使其支持 Bearer 节点认证，并准备 TLS 入口。主服务可同时设置 `TMUX_WEB_TLS_CERT`、`TMUX_WEB_TLS_KEY` 启用 HTTPS/WSS，也可使用已有的 HTTPS 反向代理；域名需与证书匹配。
+
+节点默认要求 `wss://`，最低 TLS 1.2，验证证书链和主机名，认证令牌放在请求头中，不放在 URL 中。私有 CA 使用 `--ca-file /path/to/ca.pem` 或 `TMUX_WEB_CA_FILE`。控制消息、终端数据和文件传输都经过同一 TLS 连接。
+
+节点也支持 `TMUX_WEB_NODE_TOKEN`，文件方式可避免把密钥放在进程参数中。只有显式传入 `--allow-insecure-ws` 才允许 `ws://`，用于本机测试或已有加密隧道；不能因证书报错而自行降级或关闭验证。TLS 不隐藏目标地址、时序和流量大小，不承诺规避网络策略。
 
 主服务重启时节点会自动重连并重新注册现有会话。节点进程退出或机器重启会丢失节点会话；每个节点会话是一个 shell，没有 tmux 的窗口和面板。srun 校园网登录默认关闭，仅在显式配置 `TMUX_WEB_PORTAL_URL`、`TMUX_WEB_PORTAL_USER`、`TMUX_WEB_PORTAL_PASS` 时启用。

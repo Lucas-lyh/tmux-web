@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tmux-web: a tiny web UI to select and interact with tmux sessions.
 
-Serves on 0.0.0.0:59999.
+Serves on 0.0.0.0:59999; set TMUX_WEB_TLS_CERT and TMUX_WEB_TLS_KEY for HTTPS/WSS.
   GET  /                     -> web UI (xterm.js)
   GET  /api/sessions         -> JSON list of tmux + child-node sessions
   GET  /api/new?name=...     -> create session (detached); "node:name" on a node
@@ -15,7 +15,7 @@ Serves on 0.0.0.0:59999.
   GET  /pages/<name>.html    -> serve a published page
   WS   /ws?session=...       -> attach to session via a PTY ("node:name" bridged)
   WS   /ws-upload[?node=..]  -> upload a file, replies with its temp path
-  WS   /ws-node?name=..&token=.. -> child-node link (see node.py)
+  WS   /ws-node?name=..      -> child-node link, Bearer auth (see node.py)
 
 Published pages are plain HTML files dropped into pages/ next to this file
 (typically by an agent via the tmux-web-page skill); they expire after 24h.
@@ -40,6 +40,7 @@ import pty
 import re
 import shutil
 import signal
+import ssl
 import struct
 import sys
 import subprocess
@@ -59,6 +60,20 @@ from websockets.http11 import Response
 
 HOST = os.environ.get("TMUX_WEB_HOST", "0.0.0.0")
 PORT = int(os.environ.get("TMUX_WEB_PORT", "59999"))
+
+
+def tls_context() -> ssl.SSLContext | None:
+    """Enable HTTPS/WSS when both certificate and private key are configured."""
+    cert = os.environ.get("TMUX_WEB_TLS_CERT", "")
+    key = os.environ.get("TMUX_WEB_TLS_KEY", "")
+    if not cert and not key:
+        return None
+    if not cert or not key:
+        raise RuntimeError("Set both TMUX_WEB_TLS_CERT and TMUX_WEB_TLS_KEY to enable TLS.")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(os.path.expanduser(cert), os.path.expanduser(key))
+    return context
 
 # ---------------------------------------------------------------------------
 # Authentication: salted-hash password file + opaque bearer tokens in a cookie.
@@ -154,6 +169,18 @@ def request_authed(request) -> bool:
     if auth.startswith("Bearer ") and auth[7:] == node_secret():
         return True
     return False
+
+
+def node_authed(request, query: dict) -> bool:
+    """Use a Bearer header; retain query tokens for existing node deployments."""
+    authorization = request.headers.get("Authorization", "")
+    if authorization:
+        if not authorization.startswith("Bearer "):
+            return False
+        token = authorization[7:]
+    else:
+        token = (query.get("token") or [""])[0]
+    return bool(token) and secrets.compare_digest(token.encode(), node_secret().encode())
 
 
 def login_blocked(ip: str) -> bool:
@@ -584,7 +611,8 @@ async function refreshNodes() {
   box.innerHTML = info.nodes.map(n =>
     `<div class="nodeitem">&#128421; ${esc(n.name)}<span class="meta">${n.sessions} sess</span>` +
     `<button class="ghost nodesess" data-node="${esc(n.name)}" title="new session on ${esc(n.name)}">+</button></div>`
-  ).join('') + '<div class="nodecmd" title="copy the node.py join command">+ add a node</div>';
+  ).join('') + '<div class="nodecmd nodejoin" title="copy the node.py join command">+ add a node</div>' +
+    '<div class="nodecmd nodekey" title="copy the node authentication key">copy node key</div>';
   box.querySelectorAll('.nodesess').forEach(b => b.onclick = async () => {
     const name = prompt('Session name on ' + b.dataset.node + ':');
     if (!name || !name.trim()) return;
@@ -593,11 +621,23 @@ async function refreshNodes() {
     if (r.ok) { await refresh(); attach(full); }
     else alert(await r.text());
   });
-  box.querySelector('.nodecmd').onclick = () => {
-    const cmd = 'python3 node.py --server ws://' + location.hostname + ':' + info.port +
-                '/ws-node --token ' + info.secret + ' --name <node-name>';
+  box.querySelector('.nodejoin').onclick = () => {
+    if (location.protocol !== 'https:') {
+      setStatus('Open the dashboard over HTTPS to copy an encrypted node connection command', 'bad');
+      return;
+    }
+    const cmd = 'python3 node.py --server ' + shellQuote('wss://' + location.host + '/ws-node') +
+                ' --token-file "$HOME/.tmux-web-node-secret" --name <node-name>';
     copyText(cmd);
-    setStatus('node join command copied (needs node.py from this server)', 'ok');
+    setStatus('node command copied — save the node secret in ~/.tmux-web-node-secret on the node first', 'ok');
+  };
+  box.querySelector('.nodekey').onclick = () => {
+    if (location.protocol !== 'https:') {
+      setStatus('Open the dashboard over HTTPS to copy the node key', 'bad');
+      return;
+    }
+    copyText(info.secret);
+    setStatus('node key copied — save as ~/.tmux-web-node-secret on the node with permissions 600', 'ok');
   };
 }
 
@@ -1877,6 +1917,8 @@ async def process_request(connection, request):
             login_succeeded(ip)
             cookie = (f"tmux_web_token={new_token()}; Max-Age={TOKEN_TTL}; "
                       "Path=/; HttpOnly; SameSite=Strict")
+            if getattr(request, "secure", False):
+                cookie += "; Secure"
             return http_response(200, "ok\n", "text/plain; charset=utf-8",
                                  {"Set-Cookie": cookie})
         login_failed(ip)
@@ -1884,14 +1926,14 @@ async def process_request(connection, request):
 
     if path == "/ws-node":
         # Child nodes authenticate with the node secret, not the UI cookie.
-        if ((query.get("token") or [""])[0] != node_secret()
+        if (not node_authed(request, query)
                 or not VALID_NODE.match((query.get("name") or [""])[0])):
             return http_response(401, "unauthorized\n", "text/plain; charset=utf-8")
         return None  # proceed with the websocket handshake
 
     if path == "/ws-relay":
         # TCP-over-WS relay for child nodes; same node-secret auth as /ws-node.
-        if (query.get("token") or [""])[0] != node_secret():
+        if not node_authed(request, query):
             return http_response(401, "unauthorized\n", "text/plain; charset=utf-8")
         return None  # proceed with the websocket handshake
 
@@ -2678,8 +2720,7 @@ async def handle_tcp_relay(ws) -> None:
     """
     url = urllib.parse.urlsplit(ws.request.path)
     query = urllib.parse.parse_qs(url.query)
-    token = (query.get("token") or [""])[0]
-    if not secrets.compare_digest(token, node_secret()):
+    if not node_authed(ws.request, query):
         await ws.close(4001, "bad token")
         return
     target = (query.get("target") or [""])[0]
@@ -2849,6 +2890,7 @@ async def handle_ws(ws) -> None:
 
 async def main() -> None:
     global _TOKENS
+    context = tls_context()
     _auth_state()
     _TOKENS = _load_tokens()
     node_secret()
@@ -2859,8 +2901,9 @@ async def main() -> None:
     runner = web.AppRunner(create_app(sys.modules[__name__]))
     await runner.setup()
     try:
-        await web.TCPSite(runner, HOST, PORT).start()
-        print(f"tmux-web listening on http://{HOST}:{PORT}", flush=True)
+        await web.TCPSite(runner, HOST, PORT, ssl_context=context).start()
+        scheme = "https" if context else "http"
+        print(f"tmux-web listening on {scheme}://{HOST}:{PORT}", flush=True)
         await asyncio.Future()
     finally:
         await runner.cleanup()

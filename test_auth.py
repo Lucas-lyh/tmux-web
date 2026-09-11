@@ -80,5 +80,18 @@ class SessionTests(unittest.TestCase):
         self.assertEqual([s['name'] for s in sessions], ['gpu1:train'])
 
 
+class NodeAuthenticationTests(unittest.TestCase):
+    def test_bearer_and_legacy_query_authentication(self):
+        secret = secrets.token_urlsafe(24)
+        with patch.object(server, 'node_secret', return_value=secret):
+            request = SimpleNamespace(headers={'Authorization': 'Bearer ' + secret})
+            self.assertTrue(server.node_authed(request, {}))
+            self.assertTrue(server.node_authed(SimpleNamespace(headers={}), {'token': [secret]}))
+            self.assertFalse(server.node_authed(SimpleNamespace(headers={}), {}))
+            for invalid in ('Bearer wrong', 'Bearer 非法', 'Basic invalid'):
+                request = SimpleNamespace(headers={'Authorization': invalid})
+                self.assertFalse(server.node_authed(request, {'token': [secret]}))
+
+
 if __name__ == '__main__':
     unittest.main()

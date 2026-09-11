@@ -3,7 +3,7 @@
 
 Runs against a tmux-web server (server.py):
 
-    python3 node.py --server ws://HOST:59999/ws-node --name gpu1
+    python3 node.py --server wss://HOST/ws-node --name gpu1
 
 Set TMUX_WEB_NODE_TOKEN to the server's node secret (or pass --token-file).
 The secret is available through /api/nodes or the web UI's
@@ -13,7 +13,10 @@ capture, just like local tmux sessions.
 
 Dependencies: Python 3.10+ standard library only (Unix/Linux).
 
-Protocol over a single websocket: text frames are JSON control messages;
+The node connection requires verified TLS (wss://) by default. Set
+TMUX_WEB_CA_FILE or pass --ca-file for a private certificate authority.
+Authentication uses an Authorization header inside TLS, never a URL token.
+Protocol over a single encrypted websocket: text frames are JSON control messages;
 binary frames are [kind:1B][id:8B big-endian][payload].
 Note: sessions live as long as THIS agent process lives; if the agent (or
 the machine) dies, its sessions are gone.
@@ -22,6 +25,7 @@ the machine) dies, its sessions are gone.
 import argparse
 import asyncio
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -202,8 +206,56 @@ class WsClosed(Exception):
     pass
 
 
+def validate_server_url(url: str, *, allow_insecure_ws: bool = False):
+    """Validate before urlsplit can discard characters or build HTTP headers."""
+    if (not isinstance(url, str) or not url or not url.isascii()
+            or any(ord(c) <= 32 or ord(c) == 127 for c in url)
+            or "\\" in url or "#" in url
+            or re.search(r"%(?![0-9a-fA-F]{2})", url)):
+        raise ValueError("server URL must be an ASCII URL without whitespace or a fragment")
+    try:
+        u = urllib.parse.urlsplit(url)
+        hostname, port = u.hostname, u.port
+    except ValueError:
+        raise ValueError("invalid server URL or port") from None
+    if u.scheme not in ("ws", "wss") or not hostname:
+        raise ValueError("server URL must use wss:// with a hostname")
+    if u.scheme == "ws" and not allow_insecure_ws:
+        raise ValueError("unencrypted ws:// is disabled; use wss:// (or explicitly --allow-insecure-ws)")
+    if u.username is not None or u.password is not None:
+        raise ValueError("server URL must not contain credentials")
+    if (not re.fullmatch(r"[A-Za-z0-9._:-]+", hostname)
+            or port == 0 or u.netloc.endswith(":")):
+        raise ValueError("invalid server hostname or port")
+    if any(ord(c) < 32 or ord(c) == 127 for c in urllib.parse.unquote(url)):
+        raise ValueError("server URL must not contain encoded control characters")
+    if any(key.lower() == "token" for key, _ in
+           urllib.parse.parse_qsl(u.query, keep_blank_values=True)):
+        raise ValueError("server URL must not contain a token; use --token-file or TMUX_WEB_NODE_TOKEN")
+    return u
+
+
+def validate_node_token(token: str) -> None:
+    # Bearer credentials are one visible ASCII value, never arbitrary headers.
+    if (not isinstance(token, str) or not token
+            or not re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", token)):
+        raise ValueError("node token must be a non-empty Bearer token without whitespace")
+
+
+def node_ssl_context(ca_file: str | None = None) -> ssl.SSLContext:
+    ctx = ssl.create_default_context(cafile=ca_file)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
+async def _close_writer(writer) -> None:
+    writer.close()
+    with contextlib.suppress(ConnectionError, OSError, asyncio.TimeoutError):
+        await asyncio.wait_for(writer.wait_closed(), 3)
+
+
 class Ws:
-    """Minimal RFC6455 websocket client (client-masked, no extensions)."""
+    """Minimal RFC6455 client with verified TLS, masking and no extensions."""
 
     def __init__(self, reader, writer):
         self.r = reader
@@ -213,38 +265,71 @@ class Ws:
         self.last_seen = time.time()
 
     @classmethod
-    async def connect(cls, url: str) -> "Ws":
-        u = urllib.parse.urlsplit(url)
-        if u.scheme != "ws":
-            raise ValueError("only ws:// URLs are supported (no TLS yet)")
-        port = u.port or 80
+    async def connect(cls, url: str, *, token: str | None = None,
+                      ssl_context: ssl.SSLContext | None = None,
+                      allow_insecure_ws: bool = False) -> "Ws":
+        u = validate_server_url(url, allow_insecure_ws=allow_insecure_ws)
+        if token is not None:
+            validate_node_token(token)
+        tls = u.scheme == "wss"
+        port = u.port or (443 if tls else 80)
+        options = {}
+        if tls:
+            ctx = ssl_context if ssl_context is not None else node_ssl_context()
+            if (not ctx.check_hostname or ctx.verify_mode != ssl.CERT_REQUIRED
+                    or ctx.minimum_version < ssl.TLSVersion.TLSv1_2):
+                raise ValueError("node TLS requires hostname/certificate verification and TLS 1.2 or newer")
+            options = {"ssl": ctx, "server_hostname": u.hostname,
+                       "ssl_handshake_timeout": 10}
+        writer = None
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(u.hostname, port), 10)
-        except asyncio.TimeoutError:
-            raise ConnectionError(
-                f"TCP connect to {u.hostname}:{port} timed out "
-                f"(firewall/ISP blocking, or wrong address?)")
-        key = base64.b64encode(secrets.token_bytes(16)).decode()
-        path = u.path + ("?" + u.query if u.query else "")
-        host = u.hostname if u.port is None else f"{u.hostname}:{port}"
-        writer.write((
-            f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
-            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
-            f"Sec-WebSocket-Version: 13\r\n\r\n").encode())
-        await writer.drain()
-        try:
-            resp = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 15)
-        except asyncio.TimeoutError:
-            writer.close()
-            raise ConnectionError(
-                f"handshake timed out: {u.hostname}:{port} accepted TCP but "
-                f"sent no HTTP response (half-dead tunnel/proxy?)")
-        status = resp.split(b"\r\n", 1)[0].decode("latin1")
-        if " 101" not in status:
-            writer.close()
-            raise ConnectionError(f"handshake failed: {status}")
-        return cls(reader, writer)
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(u.hostname, port, **options), 10)
+            except asyncio.TimeoutError:
+                raise ConnectionError("node TCP/TLS connection timed out") from None
+            key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+            path = (u.path or "/") + ("?" + u.query if u.query else "")
+            host = f"[{u.hostname}]" if ":" in u.hostname else u.hostname
+            if u.port is not None:
+                host += f":{port}"
+            auth = f"Authorization: Bearer {token}\r\n" if token is not None else ""
+            writer.write((
+                f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
+                f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\n{auth}\r\n").encode("ascii"))
+            await writer.drain()
+            try:
+                resp = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 15)
+            except asyncio.TimeoutError:
+                raise ConnectionError("node WebSocket handshake timed out") from None
+            lines = resp[:-4].split(b"\r\n")
+            if not re.fullmatch(rb"HTTP/1\.1 101(?: [\x20-\x7e]*)?", lines[0]):
+                # A proxy can reflect the request (including credentials) in an
+                # error response. Never include its status or headers in logs.
+                raise ConnectionError("node WebSocket handshake rejected (expected HTTP 101)")
+            headers = {}
+            for line in lines[1:]:
+                name, sep, value = line.partition(b":")
+                if (not sep or not re.fullmatch(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name)
+                        or any(c < 32 and c != 9 or c == 127 for c in value)):
+                    raise ConnectionError("invalid WebSocket handshake headers")
+                headers.setdefault(name.lower(), []).append(value.strip())
+            expected = base64.b64encode(hashlib.sha1(
+                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest())
+            connection = b",".join(headers.get(b"connection", [])).lower().split(b",")
+            if [v.lower() for v in headers.get(b"upgrade", [])] != [b"websocket"]:
+                raise ConnectionError("invalid WebSocket Upgrade header")
+            if (b"upgrade" not in [v.strip() for v in connection]
+                    or headers.get(b"sec-websocket-accept", []) != [expected]
+                    or b"sec-websocket-extensions" in headers
+                    or b"sec-websocket-protocol" in headers):
+                raise ConnectionError("invalid WebSocket handshake validation")
+            return cls(reader, writer)
+        except BaseException:
+            if writer is not None:
+                await _close_writer(writer)
+            raise
 
     async def send_frame(self, opcode: int, data: bytes) -> None:
         async with self._wlock:
@@ -303,7 +388,7 @@ class Ws:
 
     async def close(self) -> None:
         try:
-            self.w.close()
+            await _close_writer(self.w)
         except Exception:
             pass
 
@@ -359,7 +444,9 @@ class Session:
             try:
                 await self.agent.send_binary(KIND_OUTPUT, self.sid, item)
             except Exception:
-                return  # link is down; agent will re-watch after reconnect
+                # Output is also in the replay buffer. Keep this sender alive
+                # so the hub can re-watch and receive output after reconnect.
+                continue
 
     async def _reap(self) -> None:
         try:
@@ -417,10 +504,23 @@ class Session:
 class Agent:
     def __init__(self, server: str, token: str, name: str,
                  portal_user: str = "", portal_pass: str = "",
-                 portal_url: str = "", portal_insecure: bool = False):
+                 portal_url: str = "", portal_insecure: bool = False, *,
+                 ssl_context: ssl.SSLContext | None = None,
+                 allow_insecure_ws: bool = False):
+        endpoint = validate_server_url(server, allow_insecure_ws=allow_insecure_ws)
+        validate_node_token(token)
         self.server = server
+        query = [(key, value) for key, value in
+                 urllib.parse.parse_qsl(endpoint.query, keep_blank_values=True)
+                 if key != "name"]
+        query.append(("name", name))
+        self.node_url = urllib.parse.urlunsplit(
+            endpoint._replace(query=urllib.parse.urlencode(query)))
         self.token = token
         self.name = name
+        self.ssl_context = ssl_context
+        self.allow_insecure_ws = allow_insecure_ws
+        self._hello_received = False
         self.portal_user = portal_user
         self.portal_pass = portal_pass
         self.portal_url = portal_url
@@ -464,14 +564,19 @@ class Agent:
     async def run(self) -> None:
         backoff = 1
         while True:
+            self._hello_received = False
             try:
-                sep = "&" if "?" in self.server else "?"
-                url = (f"{self.server}{sep}name={urllib.parse.quote(self.name)}"
-                       f"&token={urllib.parse.quote(self.token)}")
                 print(f"[node] connecting to {urllib.parse.urlsplit(self.server).hostname} as {self.name!r} ...")
-                self.ws = await asyncio.wait_for(Ws.connect(url), 25)
+                self.ws = await asyncio.wait_for(Ws.connect(
+                    self.node_url, token=self.token, ssl_context=self.ssl_context,
+                    allow_insecure_ws=self.allow_insecure_ws), 25)
                 await self.serve()
-                backoff = 1
+            except ssl.SSLCertVerificationError:
+                print("[node] TLS certificate verification failed; check the server hostname, certificate chain or --ca-file")
+                await self.maybe_portal_login()
+            except ssl.SSLError:
+                print("[node] TLS handshake/connection failed; check the server TLS configuration")
+                await self.maybe_portal_login()
             except (WsClosed, ConnectionError, OSError, asyncio.TimeoutError,
                     asyncio.IncompleteReadError) as e:
                 print(f"[node] link down: {type(e).__name__}")
@@ -486,6 +591,8 @@ class Agent:
                 # we reconnect and re-hello with the session list.
                 for s in self.sessions.values():
                     s.watchers = 0
+                if self._hello_received:
+                    backoff = 1
             print(f"[node] retrying in {backoff}s")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
@@ -496,40 +603,54 @@ class Agent:
             "sessions": [{"sid": s.sid, "name": s.name, "cols": s.cols, "rows": s.rows}
                          for s in self.sessions.values()],
         })
-        print(f"[node] connected; {len(self.sessions)} session(s) registered")
-        while True:
-            try:
-                op, data = await asyncio.wait_for(self.ws.recv(), 60)
-            except asyncio.TimeoutError:
-                # Idle probe: the hub pings us every ~20s, so 2 minutes of
-                # total silence means the link is silently dead — reconnect.
-                if time.time() - self.ws.last_seen > 120:
-                    raise WsClosed("keepalive timeout")
-                await self.ws.send_frame(0x9, b"")
-                continue
-            if op == 1:
+        recv_task = None
+        try:
+            while True:
+                if recv_task is None:
+                    recv_task = asyncio.create_task(self.ws.recv())
                 try:
-                    msg = json.loads(data)
-                except ValueError:
+                    # Keep the same read alive across idle probes: cancelling
+                    # recv() after half a frame would lose its framing state.
+                    op, data = await asyncio.wait_for(asyncio.shield(recv_task), 60)
+                except asyncio.TimeoutError:
+                    # The hub pings us every ~20s; 2 minutes of total silence
+                    # means the link is silently dead and needs reconnecting.
+                    if time.time() - self.ws.last_seen > 120:
+                        raise WsClosed("keepalive timeout")
+                    await self.ws.send_frame(0x9, b"")
                     continue
-                await self.handle(msg)
-            elif op == 2 and len(data) >= 9:
-                kind, rid = data[0], int.from_bytes(data[1:9], "big")
-                payload = bytes(data[9:])
-                if kind == KIND_INPUT:
-                    s = self.sessions.get(rid)
-                    if s and not s.dead:
-                        try:
-                            os.write(s.fd, payload)
-                        except OSError:
-                            pass
-                elif kind == KIND_FILE_PUT:
-                    await self._put_chunk(rid, payload)
+                recv_task = None
+                if op == 1:
+                    try:
+                        msg = json.loads(data)
+                    except ValueError:
+                        continue
+                    await self.handle(msg)
+                elif op == 2 and len(data) >= 9:
+                    kind, rid = data[0], int.from_bytes(data[1:9], "big")
+                    payload = bytes(data[9:])
+                    if kind == KIND_INPUT:
+                        s = self.sessions.get(rid)
+                        if s and not s.dead:
+                            try:
+                                os.write(s.fd, payload)
+                            except OSError:
+                                pass
+                    elif kind == KIND_FILE_PUT:
+                        await self._put_chunk(rid, payload)
+        finally:
+            if recv_task is not None:
+                recv_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await recv_task
 
     # -- control messages ---------------------------------------------------
     async def handle(self, msg: dict) -> None:
         t = msg.get("type")
         if t == "hello-ok":
+            if not self._hello_received:
+                print(f"[node] connected; {len(self.sessions)} session(s) registered")
+            self._hello_received = True
             return
         if t == "new":
             await self._new(msg)
@@ -705,7 +826,11 @@ def cleanup_uploads() -> None:
 async def main() -> None:
     ap = argparse.ArgumentParser(description="tmux-web child node (no tmux required)")
     ap.add_argument("--server", required=True,
-                    help="node endpoint, e.g. ws://host:59999/ws-node")
+                    help="TLS node endpoint, e.g. wss://host/ws-node")
+    ap.add_argument("--ca-file", default=os.environ.get("TMUX_WEB_CA_FILE") or None,
+                    help="PEM CA bundle for server verification (or TMUX_WEB_CA_FILE)")
+    ap.add_argument("--allow-insecure-ws", action="store_true",
+                    help="explicitly allow unencrypted ws:// for local development or an encrypted tunnel")
     credentials = ap.add_mutually_exclusive_group()
     credentials.add_argument("--token", help="the server's node secret")
     credentials.add_argument("--token-file", help="read the node secret from this file")
@@ -729,6 +854,20 @@ async def main() -> None:
         args.token = args.token or os.environ.get("TMUX_WEB_NODE_TOKEN", "")
     if not args.token:
         ap.error("provide --token-file, --token or set TMUX_WEB_NODE_TOKEN")
+    try:
+        endpoint = validate_server_url(args.server, allow_insecure_ws=args.allow_insecure_ws)
+        validate_node_token(args.token)
+    except ValueError as e:
+        ap.error(str(e))
+    tls_context = None
+    if endpoint.scheme == "wss":
+        try:
+            tls_context = node_ssl_context(
+                os.path.expanduser(args.ca_file) if args.ca_file else None)
+        except (OSError, ValueError) as e:
+            ap.error(f"cannot load TLS trust configuration: {type(e).__name__}")
+    else:
+        print("[node] WARNING: --allow-insecure-ws sends node credentials, terminal data and files without TLS", file=sys.stderr)
     portal_config = (args.portal_url, args.portal_user, args.portal_pass)
     if any(portal_config) and not all(portal_config):
         ap.error("portal auto-login requires a URL, username and password")
@@ -739,8 +878,9 @@ async def main() -> None:
         if portal.username or portal.password or portal.query or portal.fragment:
             ap.error("--portal-url must not include credentials, a query or a fragment")
     cleanup_uploads()
-    agent = Agent(args.server.rstrip("/"), args.token, args.name,
-                  args.portal_user, args.portal_pass, args.portal_url, args.portal_insecure)
+    agent = Agent(args.server, args.token, args.name,
+                  args.portal_user, args.portal_pass, args.portal_url, args.portal_insecure,
+                  ssl_context=tls_context, allow_insecure_ws=args.allow_insecure_ws)
     await agent.run()
 
 

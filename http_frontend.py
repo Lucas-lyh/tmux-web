@@ -250,7 +250,7 @@ def create_app(backend):
     async def legacy(request):
         if request.method not in ('GET', 'HEAD'):
             return web.Response(status=405, headers={'Allow': 'GET, HEAD'})
-        adapted = SimpleNamespace(path=request.raw_path, headers=request.headers)
+        adapted = SimpleNamespace(path=request.raw_path, headers=request.headers, secure=request.secure)
         conn = SimpleNamespace(remote_address=request.transport.get_extra_info('peername') if request.transport else None)
         result = await backend.process_request(conn, adapted)
         if result is not None:
