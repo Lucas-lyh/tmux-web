@@ -33,7 +33,7 @@ def main():
         if state == original.parent or original.parent in state.parents:
             parser.error('B state must not be inside the live authentication directory')
     state = Path(ensure_private_upload_root(str(state)))
-    for name in ('.auth.json', '.tokens.json', '.node-secret', 'tmux.sock'):
+    for name in ('.auth.json', '.tokens.json', '.node-secret', '.node-credentials.json', 'tmux.sock'):
         if (state / name).is_symlink():
             parser.error('B state files must not be symlinks to another instance')
     if args.auth_from and not (state / '.auth.json').exists():

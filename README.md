@@ -38,7 +38,8 @@
 | ⌨️ 随身终端 | xterm.js 实时交互、移动端辅助按键、中文输入与断线重连 |
 | 🌐 多机一屏 | 本机 tmux + 主动接入的远程节点，统一管理 `node:session` |
 | 🔒 加密连接 | 原端口自动加密，控制消息、终端和文件统一通过 Noise 认证加密通道传输 |
-| 📦 文件直达 | 浏览器拖拽上传、点击文件路径下载； |
+| 🔑 一键接入 | 短期一次性接入命令，自动保存节点专属凭据，可逐个撤销 |
+| 📦 文件直达 | 拖拽上传、点击路径下载，传输绑定原会话；CLI 完整下载后才替换目标文件 |
 | 📊 状态速览 | CPU、内存、GPU、网络、磁盘，以及本机 Codex / Kimi Token 统计 |
 | 🪄 Agent 汇聚 | 一个session一个agent，skill支持让agent直接访问任何联网节点 |
 | 🗂️ 临时网页 | HTML 放进 `pages/` 即可展示报告；24 小时后自动清理 |
@@ -97,9 +98,11 @@ python3 node.py --server ws://hub-host:59999/ws-node \
   --token-file "$HOME/.tmux-web-node-secret" --name gpu1
 ```
 
-`--token` 和 `TMUX_WEB_NODE_TOKEN` 仍可使用；复制出的连接命令已包含必要参数，不需要再手工创建配置文件。命令含节点凭据，请只在你自己的节点执行。
+`--token` 和 `TMUX_WEB_NODE_TOKEN` 仍可使用；复制出的连接命令已包含必要参数，不需要再手工创建配置文件。
 
-**加密默认开启且不能降级关闭，算法实现内置于 `node.py`。**虽然地址仍写 `ws://`，节点业务数据已经在 WebSocket 内通过 `Noise_NNpsk0_25519_ChaChaPoly_SHA256` 加密：复用现有随机节点密钥认证，每次连接生成临时密钥，校验每条消息并拒绝篡改或重放。节点名、会话列表、控制消息、终端输入输出和文件内容都在加密通道内；节点密钥不放进网络请求 URL 或 HTTP 请求头。
+新复制的命令有效期为 **10 分钟**，成功接入后即失效，不包含主服务的管理密钥。脚本在加密通道中自动换取仅限该节点的长期凭据，以 `0600` 权限保存在 `~/.local/state/tmux-web/node-credentials/`；断线重连和再次执行同一命令会复用已保存的凭据。节点面板可撤销在线或离线节点的专属凭据。历史共享密钥接入继续兼容，不会被自动轮换。
+
+**加密默认开启且不能降级关闭，算法实现内置于 `node.py`。**虽然地址仍写 `ws://`，节点业务数据已经在 WebSocket 内通过 `Noise_NNpsk0_25519_ChaChaPoly_SHA256` 加密：每次连接生成临时密钥，校验每条消息并拒绝篡改或重放。节点名、会话列表、控制消息、终端输入输出和文件内容都在加密通道内；节点密钥不放进网络请求 URL 或 HTTP 请求头。专属凭据使用随机公开标识选择密钥，标识不包含节点名称或密钥内容。
 
 升级主服务后重新运行新版节点即可。服务端保留旧节点兼容用于迁移，旧节点不会因此自动变成加密连接。节点链路固定使用普通 WebSocket 承载脚本内置的加密记录，不使用 TLS。浏览器/API 的 HTTP 通道与节点通道分别处理；网络地址、握手、时序和数据量仍然可见，不保证规避网络策略。
 
@@ -107,7 +110,20 @@ python3 node.py --server ws://hub-host:59999/ws-node \
 
 主服务重启后节点会自动重连；**节点进程退出或机器重启会丢失其 shell 会话**。连接后可在网页或 CLI 中使用 `gpu1:train`。
 
+网页改密码会立即撤销旧网页登录，并给当前浏览器签发新登录状态；终端连接会短暂断开，底层会话与节点密钥保留。
+
 可选的 srun 校园网重连登录默认关闭；需要时显式设置 `TMUX_WEB_PORTAL_URL`、`TMUX_WEB_PORTAL_USER`、`TMUX_WEB_PORTAL_PASS`。更多参数见 `python3 node.py --help`。
+
+### CLI 自动化
+
+```bash
+.venv/bin/python client.py run gpu1:train 'printf hello'
+.venv/bin/python client.py download /tmp/result.bin ./result.bin --node gpu1
+```
+
+`run` 保留当前 shell 的环境变化，并以远端命令退出码退出。Python 调用方可用 `run_result()` 获取输出与退出码，原来的 `run()` 仍返回文本。命令结果取自终端回放，超长输出与全屏交互程序仍有回放限制。
+
+代理只重写明确的 HTML 资源属性、CSS URL 和 JavaScript 模块引用，保留普通业务字符串；动态网络请求由浏览器 shim 处理。应用使用特殊加载器或自行构造资源路径时，应配置其原生 base path。
 
 ### 开发
 

@@ -64,10 +64,161 @@ KIND_FILE_DATA = 2  # node -> hub: file-get chunk (id = request id)
 KIND_FILE_PUT = 3   # hub -> node: file-put chunk (id = request id)
 
 BUF_CAP = 256 * 1024          # per-session replay buffer
-CHUNK = 256 * 1024            # file transfer chunk size
+CHUNK = 16 * 1024             # bound each file message's encryption/send lock
 UPLOAD_DIR = "/tmp/tmux-node-uploads"
 MAX_UPLOADS = 32
 UPLOAD_IDLE_TIMEOUT = 15 * 60
+
+
+async def _file_io(operation, *args, cancel_cleanup=None):
+    """Keep blocking file I/O off the loop without closing a live worker's fd.
+
+    Cancellation waits for the one outstanding operation before unwinding its
+    owner's finally block. Resource-producing calls can dispose their result
+    if cancellation prevented ownership from reaching the caller.
+    """
+    loop = asyncio.get_running_loop()
+    future = loop.run_in_executor(None, operation, *args)
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        while not future.done():
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        try:
+            result = future.result()
+        except Exception:
+            pass
+        else:
+            if cancel_cleanup is not None:
+                cleanup = loop.run_in_executor(None, cancel_cleanup, result)
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                with contextlib.suppress(Exception):
+                    cleanup.result()
+        raise
+
+
+class CredentialError(ValueError):
+    """A fixed, credential-free cache or handoff diagnostic."""
+
+
+def node_credential_parts(token: str):
+    if not isinstance(token, str):
+        return None
+    match = re.fullmatch(r"(twj|twn)\.([0-9a-f]{32})\.([0-9a-f]{64})", token)
+    return match.groups() if match else None
+
+
+def node_credential_directory() -> str:
+    return os.path.expanduser("~/.local/state/tmux-web/node-credentials")
+
+
+def _credential_filename(server: str, name: str, credential_id: str) -> str:
+    endpoint = urllib.parse.urlsplit(server)
+    scope = [endpoint.scheme, endpoint.hostname.lower(), endpoint.port or 80,
+             endpoint.path or "/", name]
+    digest = hashlib.sha256(json.dumps(scope, separators=(",", ":")).encode()).hexdigest()
+    return digest + "." + credential_id + ".token"
+
+
+def _credential_directory_fd(create: bool):
+    directory = node_credential_directory()
+    try:
+        if create:
+            ensure_private_upload_root(directory)
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        if not create:
+            return None
+        raise CredentialError("cannot create private node credential directory") from None
+    except (OSError, ValueError):
+        raise CredentialError("node credential directory must be private and owned by this user") from None
+    try:
+        info = os.fstat(fd)
+        valid = info.st_uid == os.getuid() and info.st_mode & 0o777 == 0o700
+    except OSError:
+        valid = False
+    if not valid:
+        os.close(fd)
+        raise CredentialError("node credential directory must have private permissions")
+    return fd
+
+
+def _read_cached_credential(directory_fd: int, filename: str, credential_id: str):
+    try:
+        fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise CredentialError("cannot safely read cached node credential") from None
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o777 != 0o600 or not 0 < info.st_size <= 256):
+            raise CredentialError("cached node credential must be an owned private regular file")
+        try:
+            token = os.read(fd, 257).decode("ascii").strip()
+        except (OSError, UnicodeError):
+            raise CredentialError("cached node credential is invalid") from None
+        parts = node_credential_parts(token)
+        if parts is None or parts[0] != "twn" or parts[1] != credential_id:
+            raise CredentialError("cached node credential does not match this enrollment")
+        return token
+    finally:
+        os.close(fd)
+
+
+def load_node_credential(server: str, name: str, token: str) -> str:
+    parts = node_credential_parts(token)
+    if parts is None or parts[0] != "twj":
+        return token  # Legacy/manual credentials never create or consult state.
+    directory_fd = _credential_directory_fd(False)
+    if directory_fd is None:
+        return token
+    try:
+        return _read_cached_credential(directory_fd, _credential_filename(server, name, parts[1]), parts[1]) or token
+    finally:
+        os.close(directory_fd)
+
+
+def save_node_credential(server: str, name: str, token: str) -> None:
+    parts = node_credential_parts(token)
+    if parts is None or parts[0] != "twn":
+        raise CredentialError("only a permanent node credential can be cached")
+    filename = _credential_filename(server, name, parts[1])
+    directory_fd = _credential_directory_fd(True)
+    temporary = ".credential-" + secrets.token_hex(12) + ".tmp"
+    fd = None
+    try:
+        _read_cached_credential(directory_fd, filename, parts[1])
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=directory_fd)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            fd = None
+            stream.write((token + "\n").encode("ascii"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, filename, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    except (OSError, ValueError):
+        raise CredentialError("cannot persist private node credential") from None
+    finally:
+        if fd is not None:
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(temporary, dir_fd=directory_fd)
+        os.close(directory_fd)
 
 
 def ensure_private_upload_root(path: str) -> str:
@@ -1107,13 +1258,12 @@ class Agent:
     def __init__(self, server: str, token: str, name: str,
                  portal_user: str = "", portal_pass: str = "",
                  portal_url: str = "", portal_insecure: bool = False):
-        endpoint = validate_server_url(server)
+        validate_server_url(server)
         validate_node_token(token)
         self.server = server
-        self.node_url = urllib.parse.urlunsplit(
-            endpoint._replace(query="v=2"))
-        self.token = token
         self.name = name
+        self.token = load_node_credential(server, name, token)
+        self._refresh_node_url()
         self._hello_received = False
         self.portal_user = portal_user
         self.portal_pass = portal_pass
@@ -1127,6 +1277,29 @@ class Agent:
         self._file_tasks = {}
         self._download_cancels = {}
         self._last_upload_sweep = 0.0
+
+    def _refresh_node_url(self) -> None:
+        endpoint = urllib.parse.urlsplit(self.server)
+        parts = node_credential_parts(self.token)
+        query = "v=2"
+        if parts is not None:
+            query += "&" + urllib.parse.urlencode({"key": parts[0] + "." + parts[1]})
+        self.node_url = urllib.parse.urlunsplit(endpoint._replace(query=query))
+
+    async def _accept_credential(self, token) -> None:
+        current, replacement = node_credential_parts(self.token), node_credential_parts(token)
+        if (current is None or replacement is None or replacement[0] != "twn"
+                or replacement[1] != current[1]):
+            raise CredentialError("node credential update does not match this enrollment")
+        connection = self.ws
+        if connection is None:
+            raise CredentialError("node credential update requires an encrypted connection")
+        # No cancellation point between durable save and the in-memory switch.
+        # A disconnect during ack can immediately reconnect with the saved key.
+        save_node_credential(self.server, self.name, token)
+        self.token = token
+        self._refresh_node_url()
+        await connection.send_json({"type": "credential-ack"})
 
     async def maybe_portal_login(self) -> None:
         """The server link is down; if a campus captive portal is the cause,
@@ -1163,12 +1336,16 @@ class Agent:
         while True:
             self._hello_received = False
             try:
+                self.token = load_node_credential(self.server, self.name, self.token)
+                self._refresh_node_url()
                 print(f"[node] connecting to {urllib.parse.urlsplit(self.server).hostname} as {self.name!r} ...")
                 raw_ws = await asyncio.wait_for(Ws.connect(
                     self.node_url), 25)
                 channel = await NoiseChannel.establish(WsRaw(raw_ws), self.token, initiator=True)
                 self.ws = NodeConnection(raw_ws, channel)
                 await self.serve()
+            except CredentialError:
+                print("[node] credential handoff failed; reconnecting with the current credential")
             except (WsClosed, ConnectionError, OSError, asyncio.TimeoutError,
                     asyncio.IncompleteReadError) as e:
                 print(f"[node] link down: {type(e).__name__}")
@@ -1192,9 +1369,12 @@ class Agent:
             backoff = min(backoff * 2, 30)
 
     async def serve(self) -> None:
+        capabilities = ["file-stat", "file-get-cancel", "file-put-abort", "input-error"]
+        if node_credential_parts(self.token) is not None:
+            capabilities.append("credential-v1")
         await self.send_json({
             "type": "hello", "version": PROTO_VERSION, "name": self.name,
-            "capabilities": ["file-stat", "file-get-cancel", "file-put-abort", "input-error"],
+            "capabilities": capabilities,
             "sessions": [{"sid": s.sid, "name": s.name, "cols": s.cols, "rows": s.rows}
                          for s in self.sessions.values()],
         })
@@ -1249,6 +1429,12 @@ class Agent:
     async def handle(self, msg: dict) -> None:
         t = msg.get("type")
         if t == "hello-ok":
+            if "credential" in msg:
+                await self._accept_credential(msg["credential"])
+            else:
+                parts = node_credential_parts(self.token)
+                if parts is not None and parts[0] == "twj":
+                    raise CredentialError("enrollment did not provide a permanent node credential")
             if not self._hello_received:
                 print(f"[node] connected; {len(self.sessions)} session(s) registered")
             self._hello_received = True
@@ -1387,15 +1573,38 @@ class Agent:
             raise FileNotFoundError("not a file")
         return os.path.realpath(path)
 
+    @classmethod
+    def _download_stat(cls, msg: dict):
+        path = cls._download_path(msg)
+        info = os.stat(path)
+        if not stat.S_ISREG(info.st_mode):
+            raise FileNotFoundError("not a file")
+        return path, info
+
+    @classmethod
+    def _open_download(cls, msg: dict):
+        path = cls._download_path(msg)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            stream = os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)
+            raise
+        try:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise FileNotFoundError("not a file")
+            return stream, path, info
+        except BaseException:
+            stream.close()
+            raise
+
     async def _file_stat(self, msg: dict) -> None:
         connection = self.ws
         if connection is None:
             return
         try:
-            path = self._download_path(msg)
-            info = os.stat(path)
-            if not stat.S_ISREG(info.st_mode):
-                raise FileNotFoundError("not a file")
+            path, info = await _file_io(self._download_stat, msg)
             reply = {"type": "file-meta", "id": msg.get("id"), "ok": True,
                      "size": info.st_size, "name": os.path.basename(path)}
         except (OSError, ValueError) as exc:
@@ -1408,32 +1617,24 @@ class Agent:
         if connection is None:
             return
         cancelled = cancelled or asyncio.Event()
+        stream = None
         try:
-            path = self._download_path(msg)
-            # Open nonblocking so a file replaced by a FIFO cannot hang the
-            # event loop; metadata is then tied to this exact open file.
-            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-            try:
-                stream = os.fdopen(fd, "rb")
-            except BaseException:
-                os.close(fd)
-                raise
-            with stream as f:
-                info = os.fstat(f.fileno())
-                if not stat.S_ISREG(info.st_mode):
-                    raise FileNotFoundError("not a file")
+            stream, path, info = await _file_io(
+                self._open_download, msg, cancel_cleanup=lambda opened: opened[0].close())
+            if cancelled.is_set() or self.ws is not connection:
+                return
+            await connection.send_json({"type": "file-meta", "id": rid, "ok": True,
+                                        "size": info.st_size, "name": os.path.basename(path)})
+            while True:
                 if cancelled.is_set() or self.ws is not connection:
                     return
-                await connection.send_json({"type": "file-meta", "id": rid, "ok": True,
-                                            "size": info.st_size, "name": os.path.basename(path)})
-                while True:
-                    if cancelled.is_set() or self.ws is not connection:
-                        return
-                    chunk = f.read(CHUNK)
-                    if not chunk:
-                        break
-                    await connection.send_binary(KIND_FILE_DATA, rid, chunk)
-                    await asyncio.sleep(0)
+                chunk = await _file_io(stream.read, CHUNK)
+                if cancelled.is_set() or self.ws is not connection:
+                    return
+                if not chunk:
+                    break
+                await connection.send_binary(KIND_FILE_DATA, rid, chunk)
+                await asyncio.sleep(0)
             if not cancelled.is_set() and self.ws is connection:
                 await connection.send_json({"type": "file-end", "id": rid})
         except Exception as e:
@@ -1441,6 +1642,9 @@ class Agent:
                 with contextlib.suppress(Exception):
                     await connection.send_json({"type": "file-meta", "id": rid, "ok": False,
                                                 "error": str(e)})
+        finally:
+            if stream is not None:
+                await _file_io(stream.close)
 
     async def _put_start(self, msg: dict) -> None:
         rid = msg.get("id")
@@ -1450,7 +1654,9 @@ class Agent:
             if len(self.puts) >= MAX_UPLOADS:
                 raise ValueError("too many unfinished uploads")
             size = int(msg.get("size", -1))
-            self.puts[rid] = UploadTransfer(UPLOAD_DIR, msg.get("name", ""), size)
+            self.puts[rid] = await _file_io(
+                UploadTransfer, UPLOAD_DIR, msg.get("name", ""), size,
+                cancel_cleanup=lambda transfer: transfer.abort())
         except Exception as e:
             await self.send_json({"type": "ack", "id": rid, "ok": False, "error": str(e)})
 
@@ -1459,7 +1665,7 @@ class Agent:
         if transfer is None:
             return
         try:
-            transfer.write(payload)
+            await _file_io(transfer.write, payload)
         except Exception as exc:
             self._abort_upload(rid)
             await self.send_json({"type": "ack", "id": rid, "ok": False, "error": str(exc)})
@@ -1472,7 +1678,7 @@ class Agent:
                                   "error": "no such transfer"})
             return
         try:
-            path = transfer.finish()
+            path = await _file_io(transfer.finish)
         except Exception as exc:
             await self.send_json({"type": "ack", "id": rid, "ok": False, "error": str(exc)})
             return
@@ -1557,8 +1763,11 @@ async def main() -> None:
         cleanup_uploads()
     except (OSError, ValueError) as exc:
         ap.error(f"cannot prepare private upload directory: {type(exc).__name__}")
-    agent = Agent(args.server, args.token, args.name,
-                  args.portal_user, args.portal_pass, args.portal_url, args.portal_insecure)
+    try:
+        agent = Agent(args.server, args.token, args.name,
+                      args.portal_user, args.portal_pass, args.portal_url, args.portal_insecure)
+    except CredentialError as exc:
+        ap.error(str(exc))
     await agent.run()
 
 

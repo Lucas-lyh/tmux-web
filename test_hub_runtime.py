@@ -94,6 +94,7 @@ class IsolatedRequestTests(unittest.IsolatedAsyncioTestCase):
         request=SimpleNamespace(request=SimpleNamespace(path='/ws?session=fixture'))
         loop=asyncio.get_running_loop()
         with patch.object(server,'os',fake_os), patch.object(server.pty,'fork',return_value=(12345,4567)), \
+                patch.object(server,'request_authed',return_value=True), \
                 patch.object(server,'web_attach'), patch.object(server,'set_winsize',side_effect=OSError('setup failed')), \
                 patch.object(server,'web_detach',side_effect=subprocess.TimeoutExpired('fixture',1)), \
                 patch.object(loop,'remove_reader'), patch.object(server.asyncio,'to_thread',new_callable=AsyncMock):

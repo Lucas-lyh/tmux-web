@@ -1,10 +1,13 @@
 """HTTP frontend and authenticated, path-prefixed loopback web proxy."""
 import asyncio
 import json
+import math
+from html import escape, unescape
+from html.parser import HTMLParser
 import re
 from http.cookies import CookieError, SimpleCookie
 from types import SimpleNamespace
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 from aiohttp import web, WSMsgType
@@ -105,24 +108,289 @@ def browser_shim(prefix, port):
 </script>'''.replace('PREFIX', json.dumps(prefix)).replace('PORT', str(port))
 
 
+CSS_TOKENS = re.compile(r'''/\*.*?\*/|(?P<url>\burl\(\s*)(?P<uq>["']?)(?P<uv>(?:\\.|[^\\"')])*?)(?P=uq)\s*\)|(?P<imp>@import\s+)(?P<iq>["'])(?P<iv>(?:\\.|[^\\"'])*)(?P=iq)|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*' ''', re.I | re.S | re.X)
+
+
+def rewrite_css(text, prefix, port):
+    """Only CSS URL productions; quoted content and comments are opaque."""
+    def replace(match):
+        group = 'uv' if match.group('url') else 'iv' if match.group('imp') else None
+        if group is None or '\\' in match[group]:
+            return match[0]
+        start, end = match.span(group)
+        return match[0][:start - match.start()] + map_url(match[group], prefix, port) + match[0][end - match.start():]
+    return CSS_TOKENS.sub(replace, text)
+
+
+def javascript_tokens(text):
+    """Conservative module-specifier lexer: never inspect string/comment/regex bodies."""
+    def quoted_end(start, quote):
+        cursor = start + 1
+        while cursor < len(text):
+            if text[cursor] == '\\':
+                cursor += 2
+            elif text[cursor] == quote:
+                return cursor + 1
+            else:
+                cursor += 1
+        return cursor
+
+    def template_end(start, nesting=0):
+        if nesting > 64:
+            return len(text)  # retain unfamiliar/deep syntax verbatim
+        cursor = start + 1
+        while cursor < len(text):
+            if text[cursor] == '\\':
+                cursor += 2
+            elif text[cursor] == '`':
+                return cursor + 1
+            elif text.startswith('${', cursor):
+                cursor += 2
+                depth = 1
+                while cursor < len(text) and depth:
+                    if text[cursor] in '\'"':
+                        cursor = quoted_end(cursor, text[cursor])
+                    elif text[cursor] == '`':
+                        cursor = template_end(cursor, nesting + 1)
+                    elif text.startswith('/*', cursor):
+                        end = text.find('*/', cursor + 2)
+                        cursor = len(text) if end < 0 else end + 2
+                    elif text.startswith('//', cursor):
+                        end = text.find('\n', cursor + 2)
+                        cursor = len(text) if end < 0 else end
+                    elif text[cursor] == '/':
+                        # A regex body can contain braces and backticks. Keep
+                        # it opaque as well; unmatched division slashes fall
+                        # through to ordinary expression scanning.
+                        end, in_class = cursor + 1, False
+                        while end < len(text) and text[end] not in '\r\n':
+                            if text[end] == '\\':
+                                end += 2
+                                continue
+                            if text[end] == '[':
+                                in_class = True
+                            elif text[end] == ']':
+                                in_class = False
+                            elif text[end] == '/' and not in_class:
+                                break
+                            end += 1
+                        cursor = end + 1 if end < len(text) and text[end] == '/' else cursor + 1
+                    else:
+                        depth += (text[cursor] == '{') - (text[cursor] == '}')
+                        cursor += 1
+            else:
+                cursor += 1
+        return cursor
+
+    tokens, i = [], 0
+    word_pattern = re.compile(r'[\w$]+')
+    while i < len(text):
+        start, char = i, text[i]
+        if char.isspace():
+            i += 1
+            continue
+        if text.startswith('//', i):
+            end = text.find('\n', i + 2)
+            i = len(text) if end < 0 else end
+            continue
+        if text.startswith('/*', i):
+            end = text.find('*/', i + 2)
+            i = len(text) if end < 0 else end + 2
+            continue
+        if char in '\'"`':
+            i = template_end(i) if char == '`' else quoted_end(i, char)
+            tokens.append(('string' if char != '`' else 'template', start, i, text[start:i]))
+            continue
+        previous = tokens[-1][3] if tokens else ''
+        regex_possible = (not tokens or tokens[-1][0] == 'punct' and previous != ']' or
+                          previous in ('return', 'throw', 'case', 'yield', 'await'))
+        if char == '/' and regex_possible:
+            end, in_class = i + 1, False
+            while end < len(text) and text[end] not in '\r\n':
+                if text[end] == '\\':
+                    end += 2
+                    continue
+                if text[end] == '[':
+                    in_class = True
+                elif text[end] == ']':
+                    in_class = False
+                elif text[end] == '/' and not in_class:
+                    end += 1
+                    while end < len(text) and text[end].isalpha():
+                        end += 1
+                    tokens.append(('regex', start, end, text[start:end]))
+                    i = end
+                    break
+                end += 1
+            if i != start:
+                continue
+        word = word_pattern.match(text, i)
+        if word:
+            i = word.end()
+            tokens.append(('word', start, i, word[0]))
+        else:
+            i += 1
+            tokens.append(('punct', start, i, char))
+    return tokens
+
+
+def rewrite_javascript(text, prefix, port):
+    tokens, edits, statement = javascript_tokens(text), [], []
+    for index, (kind, start, end, value) in enumerate(tokens):
+        previous = tokens[index - 1][3] if index else ''
+        before = tokens[index - 2][3] if index > 1 else ''
+        dynamic = previous == '(' and before == 'import' and (index < 3 or tokens[index - 3][3] != '.')
+        side_effect = previous == 'import' and before != '.'
+        from_module = previous == 'from' and any(word in ('import', 'export') for word in statement)
+        if kind == 'string' and '\\' not in value and (dynamic or side_effect or from_module):
+            mapped = map_url(value[1:-1], prefix, port)
+            if mapped != value[1:-1]:
+                edits.append((start + 1, end - 1, mapped))
+        if value == ';':
+            statement = []
+        elif kind == 'word':
+            statement.append(value)
+    parts, previous = [], 0
+    for start, end, replacement in edits:
+        parts.extend((text[previous:start], replacement))
+        previous = end
+    parts.append(text[previous:])
+    return ''.join(parts)
+
+
+HTML_ATTRIBUTES = re.compile(r'''\s+(?P<name>[^\s=/>]+)(?:\s*=\s*(?:"(?P<double>[^"]*)"|'(?P<single>[^']*)'|(?P<bare>[^\s>]+)))?''')
+URL_ATTRIBUTES = {'src', 'href', 'action', 'formaction', 'poster', 'data', 'cite', 'background'}
+
+
+def rewrite_srcset(text, prefix, port):
+    """Tokenize URL candidates; commas inside a data URL are not separators."""
+    parts, previous, cursor = [], 0, 0
+    while cursor < len(text):
+        while cursor < len(text) and (text[cursor].isspace() or text[cursor] == ','):
+            cursor += 1
+        start = cursor
+        while cursor < len(text) and not text[cursor].isspace():
+            cursor += 1
+        end = cursor
+        while end > start and text[end - 1] == ',':
+            end -= 1
+        parts.extend((text[previous:start], map_url(text[start:end], prefix, port)))
+        previous = end
+        if end == cursor:
+            # Consume the width/density descriptor before the next candidate.
+            while cursor < len(text) and text[cursor] != ',':
+                cursor += 1
+    parts.append(text[previous:])
+    return ''.join(parts)
+
+
+def rewrite_importmap(text, prefix, port):
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return text
+    if not isinstance(data, dict):
+        return text
+    def specifiers(mapping):
+        if not isinstance(mapping, dict):
+            return mapping
+        return {map_url(key, prefix, port): map_url(value, prefix, port) if isinstance(value, str) else value
+                for key, value in mapping.items()}
+    result = dict(data)
+    if 'imports' in data:
+        result['imports'] = specifiers(data['imports'])
+    if isinstance(data.get('scopes'), dict):
+        result['scopes'] = {map_url(scope, prefix, port): specifiers(mapping)
+                            for scope, mapping in data['scopes'].items()}
+    return json.dumps(result, ensure_ascii=False).replace('</', '<\\/') if result != data else text
+
+
+class ProxyHTML(HTMLParser):
+    CDATA_CONTENT_ELEMENTS = ('script', 'style', 'textarea', 'title')
+    def __init__(self, prefix, port):
+        super().__init__(convert_charrefs=False)
+        self.prefix, self.port = prefix, port
+        self.parts, self.raw_kind, self.injected = [], None, False
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag == 'meta' and (attributes.get('http-equiv') or '').lower() == 'content-security-policy':
+            return
+        def replace(match):
+            name = match['name'].lower()
+            if name == 'integrity':
+                return ''  # rewritten resources cannot retain their original SRI hash
+            group = next((g for g in ('double', 'single', 'bare') if match[g] is not None), None)
+            if group is None or name not in URL_ATTRIBUTES | {'style', 'srcset', 'imagesrcset'}:
+                return match[0]
+            original = unescape(match[group])
+            if name == 'style':
+                mapped = rewrite_css(original, self.prefix, self.port)
+            elif name in ('srcset', 'imagesrcset'):
+                mapped = rewrite_srcset(original, self.prefix, self.port)
+            else:
+                mapped = map_url(original, self.prefix, self.port)
+            if mapped == original:
+                return match[0]
+            start, end = match.span(group)
+            return match[0][:start - match.start()] + escape(mapped, quote=True) + match[0][end - match.start():]
+        self.parts.append(HTML_ATTRIBUTES.sub(replace, self.get_starttag_text()))
+        if tag == 'head' and not self.injected:
+            self.parts.append(browser_shim(self.prefix, self.port))
+            self.injected = True
+        if tag == 'script':
+            script_type = (attributes.get('type') or '').lower()
+            self.raw_kind = ('js' if script_type in ('', 'module', 'text/javascript', 'application/javascript') else
+                             'importmap' if script_type == 'importmap' else 'opaque')
+        elif tag == 'style':
+            self.raw_kind = 'css'
+        elif tag in ('textarea', 'title'):
+            self.raw_kind = 'opaque'
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        self.raw_kind = None
+
+    def handle_endtag(self, tag):
+        self.parts.append('</' + tag + '>')
+        if tag in self.CDATA_CONTENT_ELEMENTS:
+            self.raw_kind = None
+
+    def handle_data(self, data):
+        if self.raw_kind == 'js':
+            data = rewrite_javascript(data, self.prefix, self.port)
+        elif self.raw_kind == 'css':
+            data = rewrite_css(data, self.prefix, self.port)
+        elif self.raw_kind == 'importmap':
+            data = rewrite_importmap(data, self.prefix, self.port)
+        self.parts.append(data)
+
+    def handle_comment(self, data):
+        self.parts.append('<!--' + data + '-->')
+
+    def handle_decl(self, data):
+        self.parts.append('<!' + data + '>')
+
+    def handle_entityref(self, name):
+        self.parts.append('&' + name + ';')
+
+    def handle_charref(self, name):
+        self.parts.append('&#' + name + ';')
+
+    def handle_pi(self, data):
+        self.parts.append('<?' + data + '>')
+
+
 def rewrite_text(text, content_type, prefix, port):
-    # Handles HTML attributes, JS module imports/root URL literals, and CSS URLs.
-    text = re.sub(r'''(["'`])((?:/(?![/\"'`])|https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?/)[^\s"'`<>]*)''',
-                  lambda m: m[1] + map_url(m[2], prefix, port), text)
-    text = re.sub(r'(url\(\s*)(/[^/\s)]+)',
-                  lambda m: m[1] + map_url(m[2], prefix, port), text, flags=re.I)
     if 'html' in content_type:
-        text = re.sub(r'''(\b(?:src|href|action|poster)\s*=\s*)(["'])(/)(\2)''',
-                      lambda m: m[1] + m[2] + prefix + m[4], text, flags=re.I)
-        text = re.sub(r'(\b(?:src|href|action|poster)\s*=\s*)(/[^/\s>]+)',
-                      lambda m: m[1] + map_url(m[2], prefix, port), text, flags=re.I)
-        # Rewritten JS/CSS no longer match the upstream integrity hash.
-        text = re.sub(r'\s+integrity\s*=\s*(["\']).*?\1', '', text, flags=re.I | re.S)
-        # The shim must run before application scripts, including with restrictive CSP.
-        text = re.sub(r'<meta\b[^>]*http-equiv\s*=\s*["\']?Content-Security-Policy["\']?[^>]*>', '', text, flags=re.I)
-        shim = browser_shim(prefix, port)
-        head = re.search(r'<head\b[^>]*>', text, re.I)
-        text = text[:head.end()] + shim + text[head.end():] if head else shim + text
+        parser = ProxyHTML(prefix, port)
+        parser.feed(text)
+        parser.close()
+        return ('' if parser.injected else browser_shim(prefix, port)) + ''.join(parser.parts)
+    if 'css' in content_type:
+        return rewrite_css(text, prefix, port)
+    if 'javascript' in content_type:
+        return rewrite_javascript(text, prefix, port)
     return text
 
 
@@ -249,9 +517,51 @@ def create_app(backend):
     app.cleanup_ctx.append(lifecycle)
 
     async def legacy(request):
-        if request.method not in ('GET', 'HEAD'):
+        post_paths = {'/api/login', '/api/passwd', '/api/node-enroll', '/api/node-revoke'}
+        path = request.raw_path
+        if request.method == 'POST' and request.path in post_paths:
+            origin = request.headers.get('Origin')
+            if origin:
+                # TLS may end at a reverse proxy. Host remains the authority;
+                # do not require the backend transport scheme to match it.
+                try:
+                    parsed_origin = urlsplit(origin)
+                    same_host = (parsed_origin.scheme in ('http', 'https') and
+                                 parsed_origin.netloc.lower() == request.host.lower() and
+                                 not (parsed_origin.path or parsed_origin.query or parsed_origin.fragment))
+                except ValueError:
+                    same_host = False
+                if not same_host:
+                    return web.Response(status=403, text='cross-origin request denied\n')
+            limit = 8192
+            if request.content_length is not None and request.content_length > limit:
+                return web.Response(status=413, text='request body too large\n')
+            body = bytearray()
+            while len(body) <= limit:
+                chunk = await request.content.read(min(4096, limit + 1 - len(body)))
+                if not chunk:
+                    break
+                body.extend(chunk)
+            if len(body) > limit:
+                return web.Response(status=413, text='request body too large\n')
+            try:
+                values = json.loads(body)
+                if not isinstance(values, dict) or any(
+                        not isinstance(key, str) or value is not None and
+                        (not isinstance(value, (str, int, float, bool)) or
+                         isinstance(value, float) and not math.isfinite(value))
+                        for key, value in values.items()):
+                    raise ValueError('expected scalar fields')
+            except (ValueError, UnicodeError):
+                return web.Response(status=400, text='expected a JSON object with scalar fields\n')
+            parsed = urlsplit(path)
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            query.update({key: ['' if value is None else str(value)] for key, value in values.items()})
+            path = urlunsplit(('', '', parsed.path, urlencode(query, doseq=True), ''))
+        elif request.method not in ('GET', 'HEAD'):
             return web.Response(status=405, headers={'Allow': 'GET, HEAD'})
-        adapted = SimpleNamespace(path=request.raw_path, headers=request.headers, secure=request.secure)
+        adapted = SimpleNamespace(path=path, headers=request.headers, secure=request.secure,
+                                  method=request.method)
         conn = SimpleNamespace(remote_address=request.transport.get_extra_info('peername') if request.transport else None)
         result = await backend.process_request(conn, adapted)
         if result is not None:

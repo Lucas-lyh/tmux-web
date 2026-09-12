@@ -27,6 +27,10 @@ import argparse
 import asyncio
 import json
 import os
+import re
+import shlex
+import tempfile
+from dataclasses import dataclass
 import sys
 import time
 import urllib.parse
@@ -45,24 +49,59 @@ def secret() -> str:
         return f.read().strip()
 
 
-def api(path: str) -> str:
+def api(path: str, timeout: float = 120) -> str:
     req = urllib.request.Request(BASE + path,
                                  headers={"Authorization": f"Bearer {secret()}"})
-    return urllib.request.urlopen(req, timeout=120).read().decode()
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return response.read().decode()
 
 
 def api_download(node: str | None, path: str, out: str) -> None:
-    q = {"path": path}
+    """Replace the destination only after a complete, verified transfer."""
+    query = {"path": path}
     if node:
-        q["node"] = node
-    url = f"{BASE}/api/download?{urllib.parse.urlencode(q)}"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {secret()}"})
-    with urllib.request.urlopen(req, timeout=600) as r, open(out, "wb") as f:
-        while True:
-            chunk = r.read(CHUNK)
-            if not chunk:
-                break
-            f.write(chunk)
+        query["node"] = node
+    req = urllib.request.Request(
+        f"{BASE}/api/download?{urllib.parse.urlencode(query)}",
+        headers={"Authorization": f"Bearer {secret()}"},
+    )
+    destination = os.path.abspath(out)
+    temporary = None
+    try:
+        with urllib.request.urlopen(req, timeout=600) as response:
+            value = response.headers.get("Content-Length")
+            expected = None if value is None else int(value)
+            if expected is not None and expected < 0:
+                raise ValueError("negative download Content-Length")
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=os.path.dirname(destination),
+                prefix="." + os.path.basename(destination) + ".", suffix=".part",
+                delete=False,
+            ) as output:
+                temporary = output.name
+                received = 0
+                while True:
+                    chunk = response.read(CHUNK)
+                    if not chunk:
+                        break
+                    received += len(chunk)
+                    if expected is not None and received > expected:
+                        raise IOError("download exceeds Content-Length")
+                    output.write(chunk)
+                if expected is not None and received != expected:
+                    raise IOError(
+                        f"incomplete download: expected {expected} bytes, received {received}"
+                    )
+                output.flush()
+                os.fsync(output.fileno())
+        os.replace(temporary, destination)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
 
 async def upload(local: str, node: str | None) -> str:
@@ -89,35 +128,75 @@ async def upload(local: str, node: str | None) -> str:
         return resp["path"]
 
 
-def send(session: str, text: str) -> None:
-    api(f"/api/send?{urllib.parse.urlencode({'name': session, 'text': text})}")
+def send(session: str, text: str, *, timeout: float = 120) -> None:
+    api(f"/api/send?{urllib.parse.urlencode({'name': session, 'text': text})}", timeout=timeout)
 
 
-def capture(session: str, lines: int = 100) -> str:
-    return api(f"/api/capture?{urllib.parse.urlencode({'name': session, 'lines': lines})}")
+def capture(session: str, lines: int = 100, *, timeout: float = 120) -> str:
+    return api(f"/api/capture?{urllib.parse.urlencode({'name': session, 'lines': lines})}", timeout=timeout)
 
 
-def run(session: str, cmd: str, timeout: int = 120, poll: float = 2.0) -> str:
-    """Run a command, detect completion via a unique marker on its own line,
-    and return the output before it.
+@dataclass(frozen=True)
+class CommandResult:
+    output: str
+    returncode: int
+    truncated: bool = False
 
-    Limits: completion is judged from `capture` (last 300 lines, ANSI-stripped),
-    so output longer than that is truncated, and full-screen TUI apps
-    (vim/less/htop) that redraw the screen can confuse the marker check.
+
+def _shell_marker(value: str) -> str:
+    # Octal escapes keep the literal marker out of terminal command echo.
+    return "".join("\\%03o" % byte for byte in value.encode("ascii"))
+
+
+def run_result(session: str, cmd: str, timeout: float = 120,
+               poll: float = 2.0) -> CommandResult:
+    """Execute in the existing POSIX shell and preserve its cwd/environment.
+
+    Output still comes from a 300-line terminal capture, not a persistent log.
+    Commands that exit/replace the shell, interactive TUIs, or an already busy
+    session cannot provide a completion result. A timeout does not kill a task.
     """
-    marker = "TW_DONE_" + os.urandom(4).hex()
-    send(session, cmd + f";echo {marker}\n")
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        time.sleep(poll)
-        lines = capture(session, 300).splitlines()
-        for i, ln in enumerate(lines):
-            if ln.strip() == marker:
-                return "\n".join(lines[:i])
-    raise TimeoutError(f"command not finished within {timeout}s: {cmd[:80]}")
+    if timeout <= 0 or poll <= 0:
+        raise ValueError("timeout and poll must be positive")
+    nonce = os.urandom(12).hex()
+    begin, end = "TW_BEGIN_" + nonce, "TW_END_" + nonce
+    variable = "__tw_status_" + nonce
+    script = (
+        "printf '\\n" + _shell_marker(begin) + "\\n'; "
+        "eval " + shlex.quote(cmd + "\n") + "; "
+        + variable + "=$?; "
+        "printf '\\n" + _shell_marker(end) + ":%s\\n' \"$" + variable + "\"; "
+        "unset " + variable + "\n"
+    )
+    deadline = time.monotonic() + timeout
+    send(session, script, timeout=timeout)
+    pattern = re.compile(re.escape(end) + r":([0-9]{1,3})$")
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("command timed out; it may still be running")
+        lines = capture(session, 300, timeout=remaining).splitlines()
+        start = None
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped == begin:
+                start = index + 1
+            match = pattern.fullmatch(stripped)
+            if match:
+                output = lines[start if start is not None else 0:index]
+                if output and output[-1] == "":
+                    output.pop()  # The separator inserted before the end marker.
+                return CommandResult("\n".join(output),
+                                     int(match[1]), start is None)
+        time.sleep(min(poll, max(0, deadline - time.monotonic())))
 
 
-def main() -> None:
+def run(session: str, cmd: str, timeout: float = 120, poll: float = 2.0) -> str:
+    """Backward-compatible text interface; run_result also exposes exit status."""
+    return run_result(session, cmd, timeout, poll).output
+
+
+def main() -> int:
     p = argparse.ArgumentParser(prog="client.py", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -164,13 +243,17 @@ def main() -> None:
     elif args.cmd == "capture":
         print(capture(args.name, args.lines))
     elif args.cmd == "run":
-        print(run(args.name, args.command, args.timeout))
+        result = run_result(args.name, args.command, args.timeout)
+        print(result.output)
+        return result.returncode
     elif args.cmd == "upload":
         print(asyncio.run(upload(args.local, args.node)))
     elif args.cmd == "download":
         api_download(args.node, args.path, args.out)
         print("downloaded ->", args.out)
 
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

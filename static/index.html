@@ -381,6 +381,19 @@
 const $ = id => document.getElementById(id);
 let current = null, ws = null, term = null, fit = null;
 let sessCache = [], currentNode = '';
+let sessionGeneration = 0;
+function sessionContext() {
+  return { session: current, node: currentNode, socket: ws, generation: sessionGeneration };
+}
+function contextIsCurrent(context) {
+  return context.generation === sessionGeneration && context.session === current &&
+    context.node === currentNode && context.socket === ws;
+}
+function sendToContext(context, text) {
+  if (!contextIsCurrent(context) || !context.socket || context.socket.readyState !== 1) return false;
+  context.socket.send(new TextEncoder().encode(text));
+  return true;
+}
 
 function esc(s){ const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
@@ -411,7 +424,11 @@ async function refreshNodes() {
   if (!info) { box.innerHTML = ''; return; }
   box.innerHTML = info.nodes.map(n =>
     `<div class="nodeitem">&#128421; ${esc(n.name)}<span class="meta">${n.encrypted ? '🔒 ' : ''}${n.sessions} sess</span>` +
-    `<button class="ghost nodesess" data-node="${esc(n.name)}" title="new session on ${esc(n.name)}">+</button></div>`
+    `<button class="ghost nodesess" data-node="${esc(n.name)}" title="new session on ${esc(n.name)}">+</button>` +
+    (n.credential_id ? `<button class="ghost noderevoke" data-id="${esc(String(n.credential_id))}" data-node="${esc(n.name)}" title="revoke this node's access">Revoke</button>` : '') + '</div>'
+  ).join('') + (info.credentials || []).filter(c => !info.nodes.some(n => n.credential_id === c.id)).map(c =>
+    `<div class="nodeitem">${esc(c.name || 'pending node')}<span class="meta">offline</span>` +
+    `<button class="ghost noderevoke" data-id="${esc(String(c.id))}" data-node="${esc(c.name || 'pending node')}" title="revoke this node's access">Revoke</button></div>`
   ).join('') + '<div class="nodecmd nodejoin" title="copy a command to download and connect an encrypted node">+ add a node</div>';
   box.querySelectorAll('.nodesess').forEach(b => b.onclick = async () => {
     const name = prompt('Session name on ' + b.dataset.node + ':');
@@ -421,21 +438,38 @@ async function refreshNodes() {
     if (r.ok) { await refresh(); attach(full); }
     else alert(await r.text());
   });
-  box.querySelector('.nodejoin').onclick = () => {
-    const bootstrap = 'import hashlib,os,pathlib,sys,tempfile,urllib.request; ' +
-      'data=urllib.request.urlopen(sys.argv[1],timeout=30).read(); ' +
-      'digest=hashlib.sha256(data).hexdigest(); ' +
-      'digest==sys.argv[2] or sys.exit("node download integrity check failed"); ' +
-      'folder=pathlib.Path(tempfile.mkdtemp(prefix="tmux-web-node-")); ' +
-      'script=folder/"node.py"; script.write_bytes(data); ' +
-      'os.environ["TMUX_WEB_NODE_TOKEN"]=sys.argv[4]; ' +
-      'os.execv(sys.executable,[sys.executable,"-S",str(script),"--server",sys.argv[3]]+sys.argv[5:])';
-    const base = location.hostname + ':' + info.port;
-    const endpoint = 'ws://' + base + '/ws-node';
-    const cmd = 'python3 -c ' + shellQuote(bootstrap) + ' ' + shellQuote('http://' + base + '/node.py') +
-      ' ' + shellQuote(info.node_script_sha256) + ' ' + shellQuote(endpoint) + ' ' + shellQuote(info.secret);
-    copyText(cmd);
-    setStatus('connection command copied — run it on the node; encryption is automatic', 'ok');
+  box.querySelectorAll('.noderevoke').forEach(b => b.onclick = async () => {
+    if (!confirm('Revoke access for node "' + b.dataset.node + '"?')) return;
+    b.disabled = true;
+    try {
+      const r = await fetch('/api/node-revoke', {method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({id: b.dataset.id})});
+      if (!r.ok) throw new Error(await r.text());
+      await refresh();
+    } catch (error) { alert('Revoke failed: ' + error.message); }
+    finally { b.disabled = false; }
+  });
+  box.querySelector('.nodejoin').onclick = async () => {
+    try {
+      const response = await fetch('/api/node-enroll', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+      if (!response.ok) throw new Error(await response.text());
+      const enrollment = await response.json();
+      const bootstrap = 'import hashlib,os,pathlib,sys,tempfile,urllib.request; ' +
+        'data=urllib.request.urlopen(sys.argv[1],timeout=30).read(); ' +
+        'digest=hashlib.sha256(data).hexdigest(); ' +
+        'digest==sys.argv[2] or sys.exit("node download integrity check failed"); ' +
+        'folder=pathlib.Path(tempfile.mkdtemp(prefix="tmux-web-node-")); ' +
+        'script=folder/"node.py"; script.write_bytes(data); ' +
+        'os.environ["TMUX_WEB_NODE_TOKEN"]=sys.argv[4]; ' +
+        'os.execv(sys.executable,[sys.executable,"-S",str(script),"--server",sys.argv[3]]+sys.argv[5:])';
+      const base = location.hostname + ':' + enrollment.port;
+      const endpoint = 'ws://' + base + '/ws-node';
+      const cmd = 'python3 -S -c ' + shellQuote(bootstrap) + ' ' + shellQuote('http://' + base + '/node.py') +
+        ' ' + shellQuote(enrollment.node_script_sha256) + ' ' + shellQuote(endpoint) + ' ' + shellQuote(enrollment.token);
+      const copied = await copyText(cmd);
+      if (!copied) prompt('Copy this one-time connection command and run it on the node before it expires:', cmd);
+      setStatus(copied ? 'one-time connection command copied — run it on the node before it expires' : 'one-time connection command ready', 'ok');
+    } catch (error) { setStatus('could not create connection command: ' + error.message, 'bad'); }
   };
 }
 
@@ -488,7 +522,7 @@ function enableTouchScroll() {
     lastY = e.touches[0].clientY; acc = 0;
   }, {passive: true});
   el.addEventListener('touchmove', e => {
-    if (lastY === null || !term) return;
+    if (lastY === null || !term || currentNode) return; // xterm owns remote shell/TUI scrolling
     const t = e.touches[0];
     acc += lastY - t.clientY;          // >0: finger moved up => scroll down
     lastY = t.clientY;
@@ -497,8 +531,7 @@ function enableTouchScroll() {
     if (!steps) return;
     acc -= steps * lineH;
     e.preventDefault();                // stop page/xterm native handling
-    const col = Math.max(1, Math.round(t.clientX / el.clientWidth * term.cols));
-    const row = Math.max(1, Math.round(t.clientY / el.clientHeight * term.rows));
+    const {col, row} = terminalCell(t.clientX, t.clientY);
     const btn = steps > 0 ? 65 : 64;   // 65 = wheel down, 64 = wheel up
     for (let i = 0; i < Math.abs(steps); i++) sendRaw(`\x1b[<${btn};${col};${row}M`);
   }, {passive: false});
@@ -520,8 +553,24 @@ $('ctrlkey').addEventListener('click', () => { setCtrl(!ctrlOn); term && term.fo
 
 /* wheel buttons: tap = 3 lines, hold = continuous scroll. Same SGR wheel
    sequences as the touch-drag translation, but deterministic. */
+function terminalCell(clientX, clientY) {
+  const rect = $('term').getBoundingClientRect();
+  return {col: Math.max(1, Math.min(term.cols, Math.floor((clientX - rect.left) / rect.width * term.cols) + 1)),
+    row: Math.max(1, Math.min(term.rows, Math.floor((clientY - rect.top) / rect.height * term.rows) + 1))};
+}
 function sendWheel(lines, up) {
   if (!term) return;
+  if (currentNode) {
+    if (!term.modes || term.modes.mouseTrackingMode === 'none') {
+      term.scrollLines(up ? -lines : lines);
+    } else {
+      const rect = $('term').getBoundingClientRect();
+      term.element.dispatchEvent(new WheelEvent('wheel', {bubbles: true, cancelable: true,
+        deltaY: (up ? -1 : 1) * lines * 40, clientX: rect.left + rect.width / 2,
+        clientY: rect.top + rect.height / 2}));
+    }
+    return;
+  }
   const col = Math.max(1, Math.floor(term.cols / 2));
   const row = Math.max(1, Math.floor(term.rows / 2));
   const btn = up ? 64 : 65;
@@ -545,21 +594,24 @@ $('ime').addEventListener('click', () => { term && term.focus(); });
 $('menu').addEventListener('click', () => document.body.classList.toggle('side-hidden'));
 
 /* ---- clickable file paths in terminal output -> download ---- */
-function nodeParam() { return currentNode ? '&node=' + encodeURIComponent(currentNode) : ''; }
-async function downloadPath(p) {
+function nodeParam(context = sessionContext()) { return context.node ? '&node=' + encodeURIComponent(context.node) : ''; }
+async function downloadPath(p, context = sessionContext()) {
+  if (!contextIsCurrent(context)) return;
+  const target = encodeURIComponent(p) + nodeParam(context);
   setStatus('checking ' + p + '…');
   try {
-    const r = await fetch('/api/download?check=1&path=' + encodeURIComponent(p) + nodeParam());
+    const r = await fetch('/api/download?check=1&path=' + target);
+    if (!contextIsCurrent(context)) return;
     if (r.status === 401) { location.reload(); return; }
     if (!r.ok) { setStatus('not a downloadable file: ' + p, 'bad'); return; }
     const a = document.createElement('a');
-    a.href = '/api/download?path=' + encodeURIComponent(p) + nodeParam();
+    a.href = '/api/download?path=' + target;
     document.body.appendChild(a);
     a.click();
     a.remove();
     setStatus('downloading ' + p, 'ok');
   } catch (e) {
-    setStatus('download failed: ' + p, 'bad');
+    if (contextIsCurrent(context)) setStatus('download failed: ' + p, 'bad');
   }
 }
 /* Server-side disambiguation for paths that wrap across lines: when a
@@ -567,20 +619,25 @@ async function downloadPath(p) {
    been glued on (e.g. the following shell prompt). The server trims the
    candidate to the longest prefix that is an existing file. */
 const resolveCache = new Map();
-async function resolvePath(p) {
-  if (resolveCache.has(p)) return resolveCache.get(p);
+const RESOLVE_POSITIVE_TTL = 30000, RESOLVE_NEGATIVE_TTL = 3000;
+async function resolvePath(p, context = sessionContext()) {
+  if (!contextIsCurrent(context)) return null;
+  const key = JSON.stringify([context.node, p]), cached = resolveCache.get(key);
+  if (cached && cached.expires > Date.now()) return cached.path;
   let r = null;
   try {
-    const resp = await fetch('/api/resolve-path?path=' + encodeURIComponent(p) + nodeParam());
+    const resp = await fetch('/api/resolve-path?path=' + encodeURIComponent(p) + nodeParam(context));
     if (resp.ok) r = (await resp.json()).path || null;
   } catch (e) { /* offline: no link */ }
-  if (resolveCache.size > 500) resolveCache.clear();
-  resolveCache.set(p, r);
+  if (!contextIsCurrent(context)) return null;
+  if (resolveCache.size >= 500) resolveCache.delete(resolveCache.keys().next().value);
+  resolveCache.set(key, {path: r, expires: Date.now() + (r ? RESOLVE_POSITIVE_TTL : RESOLVE_NEGATIVE_TTL)});
   return r;
 }
 function setupPathLinks() {
   term.registerLinkProvider({
     provideLinks(y, cb) {
+      const context = sessionContext();
       try {
         const buf = term.buffer.active;
         const K = 12;          // how many lines up/down a path may wrap
@@ -639,7 +696,7 @@ function setupPathLinks() {
               end: { x: e.x + 1, y: e.ly + 1 },
             },
             text: p,
-            activate(_ev, t) { downloadPath(t); },
+            activate(_ev, t) { downloadPath(t, context); },
           };
         };
         const re = /(~?\/(?:[^\s'"`|:;&<>(){}\[\]\\\/]+\/)*[^\s'"`|:;&<>(){}\[\]\\\/]+)/g;
@@ -674,6 +731,7 @@ function setupPathLinks() {
           }
         }
         const finish = resolved => {
+          if (!contextIsCurrent(context)) { cb([]); return; }
           const links = sameLine.filter(Boolean);
           cross.forEach((c, i) => {
             const p = resolved[i];
@@ -686,7 +744,7 @@ function setupPathLinks() {
           cb(links);
         };
         if (!cross.length) { finish([]); return; }
-        Promise.all(cross.map(c => resolvePath(c.p))).then(finish, () => finish([]));
+        Promise.all(cross.map(c => resolvePath(c.p, context))).then(finish, () => finish([]));
       } catch (e) { cb([]); }
     },
   });
@@ -718,10 +776,11 @@ function makeMouseFilter() {
 
 /* clipboard helpers: the Clipboard API needs a secure context (https), so on
    plain http we fall back to execCommand('copy') / a paste prompt. */
-function copyText(t) {
+async function copyText(t) {
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(t).catch(() => fallbackCopy(t));
-  } else fallbackCopy(t);
+    try { await navigator.clipboard.writeText(t); return true; } catch (error) {}
+  }
+  return fallbackCopy(t);
 }
 function fallbackCopy(t) {
   const ta = document.createElement('textarea');
@@ -729,8 +788,8 @@ function fallbackCopy(t) {
   ta.style.cssText = 'position:fixed;opacity:0;top:0;left:0';
   document.body.appendChild(ta);
   ta.select();
-  try { document.execCommand('copy'); } catch (e) {}
-  ta.remove();
+  try { return document.execCommand('copy'); } catch (e) { return false; }
+  finally { ta.remove(); }
 }
 function pasteClipboard() {
   if (navigator.clipboard && navigator.clipboard.readText) {
@@ -760,9 +819,11 @@ function ensureTerm() {
   // SGR wheel sequences to tmux ourselves instead of scrolling xterm's
   // scrollback. Capture phase + stopPropagation keeps xterm's own viewport
   // wheel handler from firing.
-  let wheelAcc = 0;
+  let wheelAcc = 0, wheelGeneration = -1;
   $('term').addEventListener('wheel', ev => {
-    if (!ws || ws.readyState !== 1) return;
+    // Keep remote DECSET modes intact: xterm chooses scrollback or TUI mouse reporting.
+    if (!ws || ws.readyState !== 1 || currentNode) return;
+    if (wheelGeneration !== sessionGeneration) { wheelAcc = 0; wheelGeneration = sessionGeneration; }
     ev.preventDefault();
     ev.stopPropagation();
     const px = ev.deltaMode === 1 ? ev.deltaY * 40 : ev.deltaMode === 2 ? ev.deltaY * 400 : ev.deltaY;
@@ -770,9 +831,7 @@ function ensureTerm() {
     const lines = Math.trunc(wheelAcc / 40);
     if (!lines) return;
     wheelAcc -= lines * 40;
-    const el = $('term');
-    const col = Math.max(1, Math.round(ev.offsetX / el.clientWidth * term.cols));
-    const row = Math.max(1, Math.round(ev.offsetY / el.clientHeight * term.rows));
+    const {col, row} = terminalCell(ev.clientX, ev.clientY);
     const btn = lines > 0 ? 65 : 64;
     for (let i = 0; i < Math.min(Math.abs(lines), 10); i++) sendRaw(`\x1b[<${btn};${col};${row}M`);
   }, { passive: false, capture: true });
@@ -831,6 +890,7 @@ function sendSize() {
 }
 
 function disconnect() {
+  sessionGeneration++;
   cancelRetry();
   retryCount = 0;
   if (ws) { ws.onclose = null; ws.close(); ws = null; }
@@ -871,10 +931,11 @@ function scheduleReconnect() {
 }
 
 function attach(name) {
+  sessionGeneration++;
   cancelRetry();
   if (ws) { ws.onclose = null; ws.close(); }
   current = name;
-  currentNode = (sessCache.find(s => s.name === name) || {}).node || '';
+  currentNode = (sessCache.find(s => s.name === name) || {}).node || (name.includes(':') ? name.split(':')[0] : '');
   ensureTerm();
   $('welcome').classList.add('hidden');
   $('topbar').classList.remove('hidden');
@@ -889,22 +950,24 @@ function attach(name) {
   ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') +
                      location.host + '/ws?session=' + encodeURIComponent(name));
   ws.binaryType = 'arraybuffer';
+  const context = sessionContext();
   const mouseFilter = makeMouseFilter();
   ws.onopen = () => {
+    if (!contextIsCurrent(context)) return;
     retryCount = 0;
     setStatus('connected', 'ok');
     fit.fit();
     sendSize();
     // Layout/fonts may still be settling right after open; measure again
     // shortly after so the session does not get stuck at a wrong size.
-    setTimeout(() => { try { fit.fit(); } catch(e){} sendSize(); }, 300);
+    setTimeout(() => { if (!contextIsCurrent(context)) return; try { fit.fit(); } catch(e){} sendSize(); }, 300);
     term.focus();
   };
-  ws.onmessage = ev => term.write(typeof ev.data === 'string'
-    ? ev.data.replace(MOUSE_MODE_RE, '')
-    : mouseFilter(new Uint8Array(ev.data)));
-  ws.onclose = () => { setStatus('disconnected', 'bad'); scheduleReconnect(); };
-  ws.onerror = () => { setStatus('error', 'bad'); };
+  ws.onmessage = ev => { if (!contextIsCurrent(context)) return; term.write(typeof ev.data === 'string'
+    ? (context.node ? ev.data : ev.data.replace(MOUSE_MODE_RE, ''))
+    : (context.node ? new Uint8Array(ev.data) : mouseFilter(new Uint8Array(ev.data)))); };
+  ws.onclose = () => { if (contextIsCurrent(context)) { setStatus('disconnected', 'bad'); scheduleReconnect(); } };
+  ws.onerror = () => { if (contextIsCurrent(context)) setStatus('error', 'bad'); };
   refresh();
 }
 
@@ -929,20 +992,26 @@ function shellQuote(p) {
 }
 $('upbtn').onclick = () => {
   if (!ws || ws.readyState !== 1) { alert('Attach to a session first.'); return; }
+  uploadSelectionContext = sessionContext();
   $('upfile').click();
 };
+let uploadSelectionContext = null;
 $('upfile').addEventListener('change', e => {
   const f = e.target.files[0];
   e.target.value = '';
-  if (f) uploadFile(f);
+  const context = uploadSelectionContext;
+  uploadSelectionContext = null;
+  if (f && context) uploadFile(f, context);
 });
-async function uploadFile(f) {
+async function uploadFile(f, context = sessionContext()) {
+  if (!contextIsCurrent(context) || !context.socket || context.socket.readyState !== 1) return false;
   const btn = $('upbtn');
   btn.disabled = true;
+  let u;
   try {
-    const u = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') +
+    u = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') +
                             location.host + '/ws-upload' +
-                            (currentNode ? '?node=' + encodeURIComponent(currentNode) : ''));
+                            (context.node ? '?node=' + encodeURIComponent(context.node) : ''));
     const path = await new Promise((resolve, reject) => {
       let settled = false;
       const ok = v => { if (!settled) { settled = true; resolve(v); } };
@@ -952,7 +1021,8 @@ async function uploadFile(f) {
           u.send(JSON.stringify({ name: f.name, size: f.size }));
           const CHUNK = 262144;
           for (let off = 0; off < f.size; off += CHUNK) {
-            while (u.bufferedAmount > 1 << 20) await new Promise(r => setTimeout(r, 50));
+            while (!settled && u.readyState === 1 && u.bufferedAmount > 1 << 20) await new Promise(r => setTimeout(r, 50));
+            if (settled || u.readyState !== 1) return;
             u.send(f.slice(off, off + CHUNK));
             btn.textContent = Math.min(99, Math.round((off + CHUNK) / f.size * 100)) + '%';
           }
@@ -967,11 +1037,14 @@ async function uploadFile(f) {
       u.onerror = () => bad('upload connection failed');
       u.onclose = () => bad('upload connection closed');
     });
-    sendRaw(shellQuote(path));
-    setStatus('uploaded: ' + f.name, 'ok');
+    resolveCache.delete(JSON.stringify([context.node, path]));
+    if (sendToContext(context, shellQuote(path))) setStatus('uploaded: ' + f.name, 'ok');
+    return true;
   } catch (err) {
-    alert('Upload failed: ' + err.message);
+    if (contextIsCurrent(context)) alert('Upload failed: ' + err.message);
+    return false;
   } finally {
+    if (u && u.readyState < 2) u.close();
     btn.disabled = false;
     btn.textContent = '\u{1F4E4}';
   }
@@ -999,9 +1072,10 @@ async function uploadFile(f) {
     tw.classList.remove('dragover');
     if (!ws || ws.readyState !== 1) { alert('Attach to a session first.'); return; }
     const files = [...e.dataTransfer.files];
+    const context = sessionContext();
     for (const f of files) {
-      await uploadFile(f);
-      if (f !== files[files.length - 1]) sendRaw(' ');
+      if (!await uploadFile(f, context) || !contextIsCurrent(context)) break;
+      if (f !== files[files.length - 1]) sendToContext(context, ' ');
     }
   });
   /* never let a missed drop navigate the page away */
@@ -1029,10 +1103,18 @@ $('pwsave').onclick = async () => {
   const oldpw = $('pwold').value, newpw = $('pwnew').value;
   const msg = $('pwmsg');
   if (newpw !== $('pwnew2').value) { msg.textContent = 'new passwords do not match'; return; }
-  const r = await fetch('/api/passwd?old=' + encodeURIComponent(oldpw) +
-                        '&new=' + encodeURIComponent(newpw));
-  if (r.ok) { $('pwmodal').classList.add('hidden'); alert('Password changed.'); }
-  else msg.textContent = (await r.text()).trim();
+  try {
+    const r = await fetch('/api/passwd', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({old: oldpw, new: newpw})});
+    if (r.ok) {
+      $('pwold').value = $('pwnew').value = $('pwnew2').value = '';
+      $('pwmodal').classList.add('hidden');
+      await refresh();
+      if (current) attach(current);
+      alert('Password changed.');
+    }
+    else msg.textContent = (await r.text()).trim();
+  } catch (error) { msg.textContent = 'Password change failed: ' + error.message; }
 };
 
 /* ---- host monitor ---- */
@@ -1174,6 +1256,7 @@ async function tokPoll() {
   const tot = {};
   for (const d of days) for (const [k] of TOK_TYPES) tot[k] = (tot[k] || 0) + (d[k] || 0);
   $('toksum').textContent = $('toksource').selectedOptions[0].textContent + ' · 30d total: ' + TOK_TYPES.map(([k, l]) => `${l} ${fmtNum(tot[k] || 0)}`).join(' · ');
+  if (s.parse_errors > 0) $('toksum').textContent += ' · skipped malformed records: ' + fmtNum(s.parse_errors);
 }
 
 let selectedDate = null;

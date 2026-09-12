@@ -38,9 +38,12 @@
 const pw = document.getElementById('pw'), err = document.getElementById('err');
 async function login() {
   err.textContent = '';
-  const r = await fetch('/api/login?password=' + encodeURIComponent(pw.value));
-  if (r.ok) location.reload();
-  else err.textContent = (await r.text()).trim() || 'login failed';
+  try {
+    const r = await fetch('/api/login', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({password: pw.value})});
+    if (r.ok) location.reload();
+    else err.textContent = (await r.text()).trim() || 'login failed';
+  } catch (error) { err.textContent = 'login failed: ' + error.message; }
 }
 document.getElementById('go').onclick = login;
 pw.addEventListener('keydown', e => { if (e.key === 'Enter') login(); });

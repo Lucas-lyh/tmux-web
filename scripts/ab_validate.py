@@ -33,11 +33,12 @@ import tempfile
 import time
 import urllib.parse
 
-DEFAULT_BASELINE = "979cc32"
+DEFAULT_BASELINE = "b041475"
 NODE_REFS = (
     ("query-token", "017c486", False),
     ("bearer", "b02d477", False),
     ("noise", "979cc32", True),
+    ("runtime", "b041475", True),
 )
 PRODUCTION = (
     "server.py", "node.py", "client.py", "http_frontend.py",
@@ -383,7 +384,7 @@ class HubFixture:
         if self.process.pid == old_pid:
             raise AssertionError("fixture hub did not restart")
 
-    def request(self, path, query=None, auth=True, cookie=None):
+    def request(self, path, query=None, auth=True, cookie=None, *, method="GET", data=None):
         if self.port == 59999 or not path.startswith("/") or path.startswith("//"):
             raise RuntimeError("refusing non-fixture request")
         if query:
@@ -393,9 +394,12 @@ class HubFixture:
             headers["Authorization"] = "Bearer " + self.token
         if cookie is not None:
             headers["Cookie"] = cookie
+        body = None if data is None else json.dumps(data).encode()
+        if body is not None:
+            headers["Content-Type"] = "application/json"
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=self.timeout)
         try:
-            conn.request("GET", path, headers=headers)
+            conn.request(method, path, body=body, headers=headers)
             response = conn.getresponse()
             return response.status, dict(response.getheaders()), response.read()
         finally:
@@ -449,7 +453,7 @@ class HubFixture:
             raise AssertionError("fixture upload/download bytes differ")
         return {"status": status, "size": len(received), "sha256": sha(received), "isolated": True}
 
-    def start_node(self, label, script, encrypted):
+    def start_node(self, label, script, encrypted, token=None):
         name = "ab-" + label
         directory = self.state / ("node-" + name)
         directory.mkdir()
@@ -457,7 +461,7 @@ class HubFixture:
         uploads.mkdir()
         env = dict(self.env)
         env["AB_NODE_UPLOADS"] = str(uploads)
-        env["TMUX_WEB_NODE_TOKEN"] = self.token
+        env["TMUX_WEB_NODE_TOKEN"] = token or self.token
         env["TMUX_WEB_PORTAL_URL"] = ""
         env["TMUX_WEB_PORTAL_USER"] = ""
         env["TMUX_WEB_PORTAL_PASS"] = ""
@@ -530,6 +534,11 @@ class Report:
             elif a == b:
                 status = "passed"
             elif name in approved and b.get("status") == 404:
+                status = "approved_fix"
+            elif name in ("html.login", "html.dashboard") and b.get("status") == 200 and b.get("asset_matches"):
+                # Intentional UI fixes have dedicated behavior regressions.
+                # Keep exact byte observations and require the served bytes to
+                # match the candidate's snapshotted asset; never erase a diff.
                 status = "approved_fix"
             else:
                 status = "failed"
@@ -686,10 +695,12 @@ def html_observation(hub, auth):
     status, _, body = hub.request("/", auth=auth)
     if status != 200:
         raise AssertionError("fixture HTML unavailable")
-    return {"status": status, "size": len(body), "sha256": sha(body)}
+    asset = hub.source / 'static' / ('index.html' if auth else 'login.html')
+    return {"status": status, "size": len(body), "sha256": sha(body),
+            "asset_matches": body == asset.read_bytes() if asset.is_file() else True}
 
 
-def node_suite(hub, report, label, script, encrypted, differential=False):
+def node_suite(hub, report, label, script, encrypted, differential=False, enrolled=False):
     name = "ab-" + label
     session = name + ":contract"
     prefix = "node." + label + "."
@@ -700,7 +711,16 @@ def node_suite(hub, report, label, script, encrypted, differential=False):
         return report.record(prefix + action, operation, group=group, side=side)
 
     def start():
-        hub.start_node(label, script, encrypted)
+        token = None
+        if enrolled:
+            status, _, body = hub.request("/api/node-enroll", method="POST", data={})
+            if status != 200:
+                raise AssertionError("fixture node enrollment failed")
+            token = json.loads(body)["token"]
+            report.sensitive.append(token)
+        hub.start_node(label, script, encrypted, token=token)
+        if enrolled and not hub.node_names()[name].get("credential_id"):
+            raise AssertionError("enrolled node did not obtain a scoped credential")
         return {"connected": True, "encrypted": encrypted}
 
     if record("connect", start) is None:
@@ -803,6 +823,8 @@ def main(argv=None):
                         node_suite(b, report, label, scripts[label], encrypted)
                         print("Historical node " + label + ": compatibility complete", flush=True)
                 node_suite(b, report, "candidate", b_source / "node.py", True)
+                node_suite(a, report, "candidate-old-hub", b_source / "node.py", True)
+                node_suite(b, report, "enrolled", b_source / "node.py", True, enrolled=True)
                 report.compare()
             finally:
                 for hub in reversed(fixtures):

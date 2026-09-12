@@ -16,7 +16,8 @@ class AuthTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.auth_file = Path(tmp.name) / '.auth.json'
-        for target, value in (('AUTH_FILE', str(self.auth_file)), ('_AUTH', None)):
+        for target, value in (('AUTH_FILE', str(self.auth_file)), ('_AUTH', None),
+                              ('TOKEN_FILE', str(Path(tmp.name) / '.tokens.json')), ('_TOKENS', {})):
             patcher = patch.object(server, target, value)
             patcher.start()
             self.addCleanup(patcher.stop)

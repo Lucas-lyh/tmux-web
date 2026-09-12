@@ -8,7 +8,9 @@ Serves on 0.0.0.0:59999; node application encryption is built in.
   GET  /api/kill?name=...    -> kill session
   GET  /api/send?name=..&text=.. -> type text into a session (\n = Enter)
   GET  /api/capture?name=..&lines=N -> last N lines of a session's output
-  GET  /api/nodes            -> JSON list of connected child nodes + join secret
+  GET  /api/nodes            -> connected nodes and revocable credential identifiers
+  POST /api/node-enroll      -> short-lived, single-use node enrollment grant
+  POST /api/node-revoke      -> revoke one scoped node credential
   GET  /api/stats            -> host metrics (cpu/mem/gpu/net/disk)
   GET  /api/pages            -> JSON list of published pages
   GET  /api/page/del?name=.. -> delete a published page
@@ -40,6 +42,7 @@ import pty
 import re
 import shutil
 import signal
+import stat
 import struct
 import sys
 import subprocess
@@ -49,14 +52,18 @@ import urllib.parse
 import hashlib
 import secrets
 import time
+from functools import wraps
+from weakref import WeakValueDictionary
 
-from token_usage import codex_sessions
+from token_usage import codex_sessions, codex_diagnostics
 from hub.runtime import RuntimeConfig
 from hub.storage import atomic_json
 from hub.targets import split_target
 from hub.nodes import NodeConn
 from hub.queues import offer_output as _qput
-from node import PtyWriter, UploadTransfer, cleanup_upload_root, ensure_private_upload_root
+from hub.credentials import NodeCredentials
+from hub import usage as usage_reader
+from node import PtyWriter, UploadTransfer, cleanup_upload_root, ensure_private_upload_root, _file_io
 
 from aiohttp import web
 from http_frontend import create_app
@@ -116,6 +123,13 @@ def _load_tokens() -> dict:
     try:
         with open(TOKEN_FILE) as f:
             tokens = json.load(f)
+        epoch = _auth_state().get("token_epoch", "")
+        if tokens.get("version") == 1 and isinstance(tokens.get("tokens"), dict):
+            if tokens.get("epoch", "") != epoch:
+                return {}
+            tokens = tokens["tokens"]
+        elif epoch:
+            return {}  # Password changed since this historical token file.
         now = time.time()
         return {t: exp for t, exp in tokens.items() if exp > now}
     except Exception:
@@ -140,17 +154,92 @@ def check_password(password: str) -> bool:
 
 
 def set_password(password: str) -> None:
-    auth = _auth_state()
+    global _AUTH
+    auth = dict(_auth_state())
     auth["salt"] = secrets.token_hex(16)
     auth["hash"] = _hash_pw(auth["salt"], password)
-    _save_json(AUTH_FILE, auth)
+    auth["token_epoch"] = secrets.token_hex(16)
+    try:
+        _save_json(AUTH_FILE, auth)
+    except OSError:
+        # A directory fsync can fail after the new password was renamed into
+        # place. Reflect a committed epoch so callers still revoke old sockets.
+        try:
+            with open(AUTH_FILE) as stream:
+                committed = json.load(stream) == auth
+        except (OSError, ValueError):
+            committed = False
+        if committed:
+            _AUTH = auth
+            _TOKENS.clear()
+        raise
+    _AUTH = auth
+    _TOKENS.clear()
+    # Persist the epoch first: even if this second write fails, a restart
+    # cannot resurrect tokens from before the password change.
+    _save_tokens({})
+
+
+def _save_tokens(tokens):
+    _save_json(TOKEN_FILE, {"version": 1, "epoch": _auth_state().get("token_epoch", ""),
+                            "tokens": tokens})
 
 
 def new_token() -> str:
     token = secrets.token_urlsafe(32)
-    _TOKENS[token] = time.time() + TOKEN_TTL
-    _save_json(TOKEN_FILE, _TOKENS)
+    now = time.time()
+    tokens = {key: expiry for key, expiry in _TOKENS.items() if expiry > now}
+    tokens[token] = now + TOKEN_TTL
+    _save_tokens(tokens)
+    _TOKENS.clear()
+    _TOKENS.update(tokens)
     return token
+
+
+def login_cookie(request, token):
+    cookie = (f"{COOKIE_NAME}={token}; Max-Age={TOKEN_TTL}; "
+              "Path=/; HttpOnly; SameSite=Strict")
+    return cookie + ("; Secure" if getattr(request, "secure", False) else "")
+
+
+_BROWSER_CONNECTIONS = {}
+
+
+async def finish_transaction(operation):
+    """Finish an authorized state change and its cleanup even on cancellation."""
+    task = asyncio.create_task(operation)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not task.cancelled():
+            task.exception()  # Consume failures without losing caller cancellation.
+        raise
+
+
+async def revoke_browser_connections():
+    sockets = list(_BROWSER_CONNECTIONS.values())
+    if sockets:
+        await asyncio.gather(*(asyncio.wait_for(ws.close(4001, "login changed"), 3)
+                               for ws in sockets), return_exceptions=True)
+
+
+async def revoke_node_credential(key):
+    async def transaction():
+        try:
+            return await asyncio.to_thread(NODE_CREDENTIALS.revoke, key)
+        finally:
+            if not NODE_CREDENTIALS.active(key):
+                sockets = [c.ws for c in NODES.values() if getattr(c, "credential_id", None) == key]
+                await asyncio.gather(*(asyncio.wait_for(ws.close(1008, "credential revoked"), 3)
+                                       for ws in sockets), return_exceptions=True)
+    return await finish_transaction(transaction())
 
 
 def request_authed(request) -> bool:
@@ -161,10 +250,13 @@ def request_authed(request) -> bool:
             return True
     # Local agents may authenticate with the node secret (readable from
     # .node-secret next to this file) instead of the UI cookie.
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer ") and auth[7:] == node_secret():
-        return True
-    return False
+    return operator_authed(request)
+
+
+def operator_authed(request):
+    auth = getattr(request, "headers", {}).get("Authorization", "")
+    return auth.startswith("Bearer ") and secrets.compare_digest(
+        auth[7:].encode("utf-8"), node_secret().encode("utf-8"))
 
 
 def node_authed(request, query: dict) -> bool:
@@ -210,8 +302,21 @@ def tmux(*args: str) -> subprocess.CompletedProcess:
                           timeout=5, env=RUNTIME.tmux_environment())
 
 
+async def tmux_async(*args):
+    # subprocess.run keeps the established five-second timeout; the event loop
+    # stays available while tmux starts or waits on its server socket.
+    # A cancelled waiter must retain its session lock until the actual command
+    # finishes, otherwise a late resize/mouse command can overwrite newer state.
+    return await _file_io(tmux, *args)
+
+
+
 def list_sessions() -> list:
     out = tmux("list-sessions", "-F", "#{session_name}|#{session_windows}|#{session_attached}")
+    return _session_rows(out)
+
+
+def _session_rows(out):
     sessions = []
     for line in (out.stdout.splitlines() if out.returncode == 0 else []):
         parts = line.rsplit("|", 2)
@@ -290,107 +395,19 @@ async def _page_sweeper() -> None:
 # ---------------------------------------------------------------------------
 KIMI_SESSIONS_DIR = os.path.expanduser("~/.kimi-code/sessions")
 TOKEN_KEYS = ("inputOther", "inputCacheRead", "inputCacheCreation", "output")
-_token_cache: dict[str, tuple[float, dict]] = {}  # wire path -> (mtime, {date: usage})
+_token_cache = usage_reader._token_cache
 
 
 def _wire_daily(path: str, mtime: float) -> dict:
-    cached = _token_cache.get(path)
-    if cached and cached[0] == mtime:
-        return cached[1]
-    per: dict[str, dict] = {}
-    try:
-        with open(path, errors="replace") as f:
-            for line in f:
-                if '"usage"' not in line:
-                    continue
-                try:
-                    d = json.loads(line)
-                except ValueError:
-                    continue
-                u = d.get("event", {}).get("usage") or d.get("usage")
-                t = d.get("time") or d.get("event", {}).get("time")
-                if not u or not t:
-                    continue
-                day = datetime.datetime.fromtimestamp(t / 1000).date().isoformat()
-                a = per.setdefault(day, dict.fromkeys(TOKEN_KEYS, 0) | {"steps": 0})
-                a["steps"] += 1
-                for k in TOKEN_KEYS:
-                    a[k] += u.get(k, 0)
-    except OSError:
-        pass
-    _token_cache[path] = (mtime, per)
-    return per
+    return usage_reader._wire_daily(path, mtime)
 
 
 def _kimi_token_stats(days: int = 30) -> dict:
-    today = datetime.date.today()
-    cutoff = today - datetime.timedelta(days=days - 1)
-    cutoff_ts = time.mktime(cutoff.timetuple())
-    merged: dict[str, dict] = {}
-    for wf in glob.glob(os.path.join(KIMI_SESSIONS_DIR, "*", "session_*", "agents", "*", "wire.jsonl")):
-        try:
-            mtime = os.stat(wf).st_mtime
-        except OSError:
-            continue
-        if mtime < cutoff_ts - 86400:
-            continue  # untouched for the whole window: nothing to contribute
-        for day, a in _wire_daily(wf, mtime).items():
-            if day < cutoff.isoformat():
-                continue
-            b = merged.setdefault(day, dict.fromkeys(TOKEN_KEYS, 0))
-            for k in TOKEN_KEYS:
-                b[k] += a[k]
-    return {
-        "types": list(TOKEN_KEYS),
-        "days": [
-            {"date": (cutoff + datetime.timedelta(days=i)).isoformat(),
-             **merged.get((cutoff + datetime.timedelta(days=i)).isoformat(),
-                          dict.fromkeys(TOKEN_KEYS, 0))}
-            for i in range(days)
-        ],
-    }
+    return usage_reader._kimi_token_stats(days, sessions_dir=KIMI_SESSIONS_DIR)
 
 
 def _kimi_token_day(date: str) -> dict:
-    """Per-session usage breakdown for one day (YYYY-MM-DD)."""
-    day_start = time.mktime(datetime.date.fromisoformat(date).timetuple())
-    sessions: dict[str, dict] = {}
-    totals = dict.fromkeys(TOKEN_KEYS, 0) | {"steps": 0}
-    for wf in glob.glob(os.path.join(KIMI_SESSIONS_DIR, "*", "session_*", "agents", "*", "wire.jsonl")):
-        try:
-            mtime = os.stat(wf).st_mtime
-        except OSError:
-            continue
-        if mtime < day_start:
-            continue  # last modified before this day: cannot contain it
-        a = _wire_daily(wf, mtime).get(date)
-        if not a:
-            continue
-        sess_dir = os.path.dirname(os.path.dirname(os.path.dirname(wf)))
-        sid = sess_dir.split("session_")[-1]
-        s = sessions.setdefault(sid, dict.fromkeys(TOKEN_KEYS, 0) | {"steps": 0})
-        s["steps"] += a["steps"]
-        for k in TOKEN_KEYS:
-            s[k] += a[k]
-            totals[k] += a[k]
-        totals["steps"] += a["steps"]
-
-    out = []
-    for sid, s in sessions.items():
-        sess_dir = os.path.join(KIMI_SESSIONS_DIR, "*", f"session_{sid}")
-        title, cwd = "", ""
-        for d in glob.glob(sess_dir):
-            try:
-                meta = json.load(open(os.path.join(d, "state.json")))
-                title = meta.get("title") or meta.get("lastPrompt") or ""
-                cwd = meta.get("cwd") or ""
-            except Exception:
-                pass
-            break
-        out.append({"id": sid, "title": title[:80], "cwd": cwd, "steps": s["steps"],
-                    **{k: s[k] for k in TOKEN_KEYS}})
-    out.sort(key=lambda x: -(x["inputOther"] + x["inputCacheRead"] + x["output"]))
-    return {"date": date, "totals": totals, "sessions": out}
+    return usage_reader._kimi_token_day(date, sessions_dir=KIMI_SESSIONS_DIR)
 
 
 _token_lock = asyncio.Lock()
@@ -409,6 +426,7 @@ def token_stats(days: int = 30, source: str = "kimi") -> dict:
                 if date in rows:
                     for k in TOKEN_KEYS:
                         rows[date][k] += usage[k]
+        result["parse_errors"] = result.get("parse_errors", 0) + codex_diagnostics()["parse_errors"]
     result["source"] = source
     return result
 
@@ -427,6 +445,7 @@ def token_day(date: str, source: str = "kimi") -> dict:
                 result["sessions"].append({k: v for k, v in s.items() if k != "days"} | usage)
                 for k in (*TOKEN_KEYS, "steps"):
                     result["totals"][k] += usage[k]
+        result["parse_errors"] = result.get("parse_errors", 0) + codex_diagnostics()["parse_errors"]
     result["sessions"].sort(key=lambda s: -sum(s[k] for k in TOKEN_KEYS))
     result["source"] = source
     return result
@@ -564,6 +583,51 @@ def collect_stats() -> dict:
     }
 
 
+_STATS_CACHE = None
+_STATS_AT = 0.0
+_STATS_TASK = None
+
+
+async def _sample_stats():
+    global _STATS_CACHE, _STATS_AT
+    result = await asyncio.to_thread(collect_stats)
+    _STATS_CACHE, _STATS_AT = result, time.monotonic()
+    return result
+
+
+async def stats_snapshot():
+    global _STATS_TASK
+    if _STATS_TASK is None or (_STATS_TASK.done() and time.monotonic() - _STATS_AT >= 2):
+        _STATS_TASK = asyncio.create_task(_sample_stats())
+        _STATS_TASK.add_done_callback(lambda task: None if task.cancelled() else task.exception())
+    if _STATS_CACHE is not None:
+        return _STATS_CACHE
+    return await asyncio.shield(_STATS_TASK)
+
+
+async def _stats_sampler():
+    while True:
+        try:
+            await stats_snapshot()
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+        await asyncio.sleep(2)
+
+
+def _read_local_download(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("not a regular file")
+        if info.st_size > 1024**3:
+            raise ValueError("file too large")
+        data = stream.read(info.st_size + 1)
+        if len(data) != info.st_size:
+            raise OSError("file changed during download")
+        return data
+
+
 async def process_request(connection, request):
     url = urllib.parse.urlsplit(request.path)
     path, query = url.path, urllib.parse.parse_qs(url.query)
@@ -577,10 +641,7 @@ async def process_request(connection, request):
             return http_response(429, "too many attempts, try again later\n", "text/plain; charset=utf-8")
         if check_password((query.get("password") or [""])[0]):
             login_succeeded(ip)
-            cookie = (f"{COOKIE_NAME}={new_token()}; Max-Age={TOKEN_TTL}; "
-                      "Path=/; HttpOnly; SameSite=Strict")
-            if getattr(request, "secure", False):
-                cookie += "; Secure"
+            cookie = login_cookie(request, new_token())
             return http_response(200, "ok\n", "text/plain; charset=utf-8",
                                  {"Set-Cookie": cookie})
         login_failed(ip)
@@ -629,11 +690,38 @@ async def process_request(connection, request):
             return http_response(403, "current password incorrect\n", "text/plain; charset=utf-8")
         if not 6 <= len(new) <= 128:
             return http_response(400, "new password must be 6-128 characters\n", "text/plain; charset=utf-8")
-        set_password(new)
-        return http_response(200, "ok\n", "text/plain; charset=utf-8")
+        previous_epoch = _auth_state().get("token_epoch", "")
+        try:
+            set_password(new)
+            cookie = login_cookie(request, new_token())
+        finally:
+            if _auth_state().get("token_epoch", "") != previous_epoch:
+                await finish_transaction(revoke_browser_connections())
+        return http_response(200, "ok\n", "text/plain; charset=utf-8", {"Set-Cookie": cookie})
+
+    if path == "/api/node-enroll":
+        if getattr(request, "method", "GET") != "POST":
+            return http_response(405, "use POST\n", "text/plain", {"Allow": "POST"})
+        try:
+            token = await asyncio.to_thread(NODE_CREDENTIALS.issue)
+        except ValueError:
+            return http_response(429, "too many pending enrollment commands\n", "text/plain")
+        return http_response(200, json.dumps({"token": token, "expires_in": 600,
+            "node_script_sha256": hashlib.sha256(node_script_bytes()).hexdigest(), "port": PORT}),
+            "application/json")
+
+    if path == "/api/node-revoke":
+        if getattr(request, "method", "GET") != "POST":
+            return http_response(405, "use POST\n", "text/plain", {"Allow": "POST"})
+        key = (query.get("id") or [""])[0]
+        if not re.fullmatch(r"[0-9a-f]{32}", key):
+            return http_response(400, "invalid credential id\n", "text/plain")
+        if not await revoke_node_credential(key):
+            return http_response(404, "credential not found\n", "text/plain")
+        return http_response(200, "ok\n", "text/plain")
 
     if path == "/api/sessions":
-        return http_response(200, json.dumps(list_sessions()), "application/json")
+        return http_response(200, json.dumps(_session_rows(await tmux_async("list-sessions", "-F", "#{session_name}|#{session_windows}|#{session_attached}"))), "application/json")
 
     if path == "/api/new":
         name = (query.get("name") or [""])[0]
@@ -655,7 +743,7 @@ async def process_request(connection, request):
                 return http_response(409, (r.get("error") or "failed") + "\n", "text/plain; charset=utf-8")
             node.sessions[int(r["sid"])] = {"name": sname, "cols": 220, "rows": 50}
             return http_response(200, "ok\n", "text/plain; charset=utf-8")
-        r = tmux("new-session", "-d", "-s", sname, "-x", "220", "-y", "50")
+        r = await tmux_async("new-session", "-d", "-s", sname, "-x", "220", "-y", "50")
         if r.returncode != 0:
             return http_response(409, r.stderr or "failed\n", "text/plain; charset=utf-8")
         return http_response(200, "ok\n", "text/plain; charset=utf-8")
@@ -676,7 +764,7 @@ async def process_request(connection, request):
                 return http_response(404, (r.get("error") or "failed") + "\n", "text/plain; charset=utf-8")
             node.sessions.pop(sid, None)
             return http_response(200, "ok\n", "text/plain; charset=utf-8")
-        r = tmux("kill-session", "-t", name)
+        r = await tmux_async("kill-session", "-t", name)
         if r.returncode != 0:
             return http_response(404, r.stderr or "failed\n", "text/plain; charset=utf-8")
         return http_response(200, "ok\n", "text/plain; charset=utf-8")
@@ -695,11 +783,11 @@ async def process_request(connection, request):
         parts = text.split("\n")
         for i, part in enumerate(parts):
             if part:
-                r = tmux("send-keys", "-t", name, "-l", "--", part)
+                r = await tmux_async("send-keys", "-t", name, "-l", "--", part)
                 if r.returncode != 0:
                     return http_response(404, r.stderr or "failed\n", "text/plain; charset=utf-8")
             if i < len(parts) - 1:
-                tmux("send-keys", "-t", name, "Enter")
+                await tmux_async("send-keys", "-t", name, "Enter")
         return http_response(200, "ok\n", "text/plain; charset=utf-8")
 
     if path == "/api/capture":
@@ -721,22 +809,23 @@ async def process_request(connection, request):
             if not r.get("ok"):
                 return http_response(404, (r.get("error") or "failed") + "\n", "text/plain; charset=utf-8")
             return http_response(200, r.get("text", ""), "text/plain; charset=utf-8")
-        r = tmux("capture-pane", "-p", "-t", name, "-S", str(-lines))
+        r = await tmux_async("capture-pane", "-p", "-t", name, "-S", str(-lines))
         if r.returncode != 0:
             return http_response(404, r.stderr or "failed\n", "text/plain; charset=utf-8")
         return http_response(200, r.stdout, "text/plain; charset=utf-8")
 
     if path == "/api/nodes":
         return http_response(200, json.dumps({
-            "secret": node_secret(),
             "node_script_sha256": hashlib.sha256(node_script_bytes()).hexdigest(),
             "port": PORT,
+            "credentials": await asyncio.to_thread(NODE_CREDENTIALS.public_records),
             "nodes": [{"name": n, "sessions": len(c.sessions),
-                       "encrypted": getattr(c, "encrypted", False)} for n, c in NODES.items()],
+                       "encrypted": getattr(c, "encrypted", False),
+                       "credential_id": getattr(c, "credential_id", None)} for n, c in NODES.items()],
         }), "application/json")
 
     if path == "/api/stats":
-        return http_response(200, json.dumps(collect_stats()), "application/json")
+        return http_response(200, json.dumps(await stats_snapshot()), "application/json")
 
     if path in ("/api/tokens", "/api/tokens/day"):
         source = (query.get("source") or ["kimi"])[0]
@@ -876,8 +965,9 @@ async def process_request(connection, request):
             size = os.path.getsize(rp)
             if size > 1024**3:
                 return http_response(413, "file too large (max 1 GiB)\n", "text/plain; charset=utf-8")
-            with open(rp, "rb") as f:
-                data = f.read()
+            data = await asyncio.to_thread(_read_local_download, rp)
+        except ValueError:
+            return http_response(413, "file too large (max 1 GiB)\n", "text/plain; charset=utf-8")
         except OSError:
             return http_response(403, "unreadable\n", "text/plain; charset=utf-8")
         name = os.path.basename(rp) or "file"
@@ -914,15 +1004,27 @@ _attach_state: dict[str, dict] = {}
 _last_size: dict[str, tuple[int, int]] = {}
 
 
-def _tmux_out(*args: str) -> str:
-    r = tmux(*args)
+_attach_locks = WeakValueDictionary()
+
+
+def serialize_attach(fn):
+    @wraps(fn)
+    async def wrapped(name, *args):
+        lock = _attach_locks.setdefault(name, asyncio.Lock())
+        async with lock:
+            return await fn(name, *args)
+    return wrapped
+
+
+async def _tmux_out(*args: str) -> str:
+    r = await tmux_async(*args)
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
-def _status_lines(name: str) -> int:
+async def _status_lines(name: str) -> int:
     # session-level value is empty unless explicitly set; fall back to global
-    v = _tmux_out("show-option", "-t", name, "-v", "status") or \
-        _tmux_out("show-option", "-gv", "status")
+    v = await _tmux_out("show-option", "-t", name, "-v", "status") or \
+        await _tmux_out("show-option", "-gv", "status")
     if v in ("", "off"):
         return 1 if v == "" else 0
     if v == "on":
@@ -933,7 +1035,7 @@ def _status_lines(name: str) -> int:
         return 1
 
 
-def _apply_size(name: str, st: dict) -> None:
+async def _apply_size(name: str, st: dict) -> None:
     """Resize the session's current window to the size owner's dimensions."""
     cid = st.get("owner")
     size = st["sizes"].get(cid) if cid is not None else None
@@ -947,7 +1049,7 @@ def _apply_size(name: str, st: dict) -> None:
         if node and sid is not None:
             asyncio.create_task(node.set_size(sid, cols, rows))
         return
-    tmux("resize-window", "-t", name, "-x", str(cols),
+    await tmux_async("resize-window", "-t", name, "-x", str(cols),
          "-y", str(max(1, rows - st.get("status_lines", 1))))
 
 
@@ -955,71 +1057,88 @@ async def _size_watchdog(name: str) -> None:
     try:
         while True:
             await asyncio.sleep(2)
-            st = _attach_state.get(name)
-            if not st or st["count"] <= 0:
+            if not await _check_size(name):
                 return
-            if split_node(name)[0]:
-                # Node sessions own their pty outright: no competing clients,
-                # just keep the owner's size applied (e.g. after a node
-                # reconnect creates a fresh attach).
-                _apply_size(name, st)
-                continue
-            st["status_lines"] = _status_lines(name)
-            cid = st.get("owner")
-            size = st["sizes"].get(cid) if cid is not None else None
-            if not size:
-                continue
-            cols, rows = size
-            want = (cols, max(1, rows - st["status_lines"]))
-            cur = ""
-            for line in _tmux_out(
-                    "list-windows", "-t", name,
-                    "-F", "#{window_active} #{window_width} #{window_height}").splitlines():
-                if line.startswith("1 "):
-                    cur = line[2:]
-                    break
-            try:
-                got = tuple(int(x) for x in cur.split())
-            except ValueError:
-                continue
-            if got != want:
-                tmux("resize-window", "-t", name, "-x", str(want[0]), "-y", str(want[1]))
     except asyncio.CancelledError:
         pass
 
 
-def web_attach(name: str, cid: int, cols: int, rows: int) -> None:
-    st = _attach_state.setdefault(name, {"count": 0, "orig": None})
-    if st["count"] == 0:
+@serialize_attach
+async def _check_size(name):
+    st = _attach_state.get(name)
+    if not st or st["count"] <= 0:
+        return False
+    try:
+        if split_node(name)[0]:
+            await _apply_size(name, st)
+            return True
+        st["status_lines"] = await _status_lines(name)
+        cid = st.get("owner")
+        size = st["sizes"].get(cid) if cid is not None else None
+        if size:
+            cols, rows = size
+            want = (cols, max(1, rows - st["status_lines"]))
+            for line in (await _tmux_out("list-windows", "-t", name,
+                    "-F", "#{window_active} #{window_width} #{window_height}")).splitlines():
+                if line.startswith("1 ") and tuple(map(int, line[2:].split())) != want:
+                    await tmux_async("resize-window", "-t", name, "-x", str(want[0]), "-y", str(want[1]))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass  # A temporarily unavailable tmux server should not kill the watchdog.
+    return True
+
+
+@serialize_attach
+async def web_attach(name: str, cid: int, cols: int, rows: int) -> None:
+    st = _attach_state.get(name)
+    if st is None:
+        st = {"count": 0, "orig": None, "status_lines": 0, "sizes": {}, "owner": None}
         if split_node(name)[0]:
             st["orig"] = None  # no tmux options on node sessions
             st["status_lines"] = 0
         else:
-            r = tmux("show-option", "-t", name, "-v", "mouse")
+            r = await tmux_async("show-option", "-t", name, "-v", "mouse")
             st["orig"] = r.stdout.strip() if r.returncode == 0 else "off"
-            tmux("set-option", "-t", name, "mouse", "on")
-            st["status_lines"] = _status_lines(name)
-        st["sizes"] = {}
-        st["owner"] = None
+            try:
+                await tmux_async("set-option", "-t", name, "mouse", "on")
+                st["status_lines"] = await _status_lines(name)
+            except BaseException:
+                try:
+                    await tmux_async("set-option", "-t", name, "mouse", st["orig"])
+                except Exception:
+                    pass
+                raise
+        _attach_state[name] = st
         st["watchdog"] = asyncio.create_task(_size_watchdog(name))
+    if cid in st["sizes"]:
+        return
     st["count"] += 1
     st["sizes"][cid] = (cols, rows)
     st["owner"] = cid  # newest attach takes ownership
-    _apply_size(name, st)
+    await _apply_size(name, st)
 
 
-def web_resize(name: str, cid: int, cols: int, rows: int) -> None:
+@serialize_attach
+async def web_resize(name: str, cid: int, cols: int, rows: int) -> None:
     st = _attach_state.get(name)
-    if not st:
+    if not st or cid not in st["sizes"]:
         return
     st["sizes"][cid] = (cols, rows)
     st["owner"] = cid  # actively resizing a browser: that client owns the size
-    _apply_size(name, st)
+    await _apply_size(name, st)
 
 
-def web_detach(name: str, cid: int) -> None:
+@serialize_attach
+async def web_activate(name: str, cid: int):
     st = _attach_state.get(name)
-    if not st:
+    if st and cid in st["sizes"] and st.get("owner") != cid:
+        st["owner"] = cid
+        await _apply_size(name, st)
+
+
+@serialize_attach
+async def web_detach(name: str, cid: int) -> None:
+    st = _attach_state.get(name)
+    if not st or cid not in st["sizes"]:
         return
     st["count"] -= 1
     st["sizes"].pop(cid, None)
@@ -1029,13 +1148,12 @@ def web_detach(name: str, cid: int) -> None:
             wd.cancel()
         _attach_state.pop(name, None)
         if st["orig"] == "off":
-            tmux("set-option", "-t", name, "mouse", "off")
+            await tmux_async("set-option", "-t", name, "mouse", "off")
     elif st["owner"] == cid:
         # Owner left: hand ownership to a remaining client and snap the
         # window to its size.
         st["owner"] = next(iter(st["sizes"]), None)
-        _apply_size(name, st)
-
+        await _apply_size(name, st)
 
 # ---------------------------------------------------------------------------
 # Child nodes: remote machines running node.py connect over /ws-node and
@@ -1044,6 +1162,7 @@ def web_detach(name: str, cid: int) -> None:
 # stream/file data as [kind:1B][id:8B big-endian][payload].
 # ---------------------------------------------------------------------------
 NODE_SECRET_FILE = str(RUNTIME.state_dir / ".node-secret")
+NODE_CREDENTIALS = NodeCredentials(RUNTIME.state_dir / ".node-credentials.json")
 NODE_PROTO_VERSION = 2
 VALID_NODE = re.compile(r"^[\w.\-]{1,32}$", re.UNICODE)
 
@@ -1075,41 +1194,66 @@ def split_node(name: str):
     return split_target(name)
 
 
+_REGISTERING_NAMES = set()
+
+
 async def handle_node_ws(ws) -> None:
     url = urllib.parse.urlsplit(ws.request.path)
     query = urllib.parse.parse_qs(url.query)
     name = (query.get("name") or [""])[0]
     encrypted = query.get("v") == ["2"]
+    selector = (query.get("key") or [""])[0]
+    credential_id = None
+    node = None
+    reserved_name = None
     try:
+        token = None
         if encrypted:
             from node import NoiseChannel
-            ws = await asyncio.wait_for(NoiseChannel.establish(ws, node_secret(), initiator=False), 10)
+            token = await asyncio.to_thread(NODE_CREDENTIALS.lookup, selector) if selector else node_secret()
+            ws = await asyncio.wait_for(NoiseChannel.establish(ws, token, initiator=False), 10)
         raw = await asyncio.wait_for(ws.recv(), 15)
         hello = json.loads(raw) if isinstance(raw, str) else {}
-        if hello.get("type") != "hello":
+        if not isinstance(hello, dict) or hello.get("type") != "hello":
             raise ValueError("expected hello")
         if encrypted:
             name = hello.get("name", "")
             if hello.get("version") != NODE_PROTO_VERSION or not isinstance(name, str) or not VALID_NODE.fullmatch(name):
                 raise ValueError("invalid encrypted node registration")
+        if name in NODES or name in _REGISTERING_NAMES:
+            raise ValueError("node name already connected")
+        reserved_name = name
+        _REGISTERING_NAMES.add(name)
         node = NodeConn(ws, name)
         node.encrypted = encrypted
         features = hello.get("capabilities", [])
         if isinstance(features, list):
             node.capabilities = frozenset(value for value in features if isinstance(value, str))
-        for s in hello.get("sessions", []):
-            node.sessions[int(s["sid"])] = {
-                "name": str(s.get("name", ""))[:64],
-                "cols": int(s.get("cols", 220)), "rows": int(s.get("rows", 50))}
-    except (ValueError, KeyError, TypeError, ConnectionError, asyncio.TimeoutError):
-        await ws.close(1008, "node authentication failed")
-        return
-    if name in NODES:
-        await ws.close(1008, "node name already connected")
-        return
-    NODES[name] = node
-    try:
-        await node.send_json({"type": "hello-ok", "version": NODE_PROTO_VERSION})
+        for session in hello.get("sessions", []):
+            node.sessions[int(session["sid"])] = {
+                "name": str(session.get("name", ""))[:64],
+                "cols": int(session.get("cols", 220)), "rows": int(session.get("rows", 50))}
+        reply = {"type": "hello-ok", "version": NODE_PROTO_VERSION}
+        if encrypted and selector:
+            if "credential-v1" not in node.capabilities:
+                raise ValueError("node does not support credential handoff")
+            credential_id, credential = await _file_io(
+                NODE_CREDENTIALS.prepare, selector, name, token,
+                cancel_cleanup=lambda result: NODE_CREDENTIALS.release(result[0]))
+            node.credential_id = credential_id
+            if credential:
+                reply["credential"] = credential
+        await node.send_json(reply)
+        if "credential" in reply:
+            ack = await asyncio.wait_for(ws.recv(), 15)
+            if not isinstance(ack, str) or json.loads(ack).get("type") != "credential-ack":
+                raise ValueError("credential was not saved")
+            await asyncio.to_thread(NODE_CREDENTIALS.complete, credential_id)
+        if credential_id:
+            # Revocation may race the disk write or encrypted handoff.
+            if not NODE_CREDENTIALS.active(credential_id):
+                raise ValueError("node credential revoked")
+        NODES[name] = node
         async for msg in ws:
             if isinstance(msg, str):
                 await node.handle_text(json.loads(msg))
@@ -1123,12 +1267,19 @@ async def handle_node_ws(ws) -> None:
                     q = node.file_queues.get(rid)
                     if q is not None:
                         await q.put(payload)
-    except (ValueError, KeyError, TypeError, ConnectionError):
-        pass
+    except (ValueError, KeyError, TypeError, ConnectionError, OSError, asyncio.TimeoutError):
+        await ws.close(1008, "node authentication or connection failed")
     finally:
-        if NODES.get(name) is node:
-            NODES.pop(name, None)
-        await node.close()
+        try:
+            if credential_id:
+                await _file_io(NODE_CREDENTIALS.release, credential_id)
+        finally:
+            if reserved_name is not None:
+                _REGISTERING_NAMES.discard(reserved_name)
+            if node is not None:
+                if NODES.get(name) is node:
+                    NODES.pop(name, None)
+                await node.close()
 
 
 async def handle_node_attach(ws, node: NodeConn, key: str, sname: str) -> None:
@@ -1160,18 +1311,15 @@ async def handle_node_attach(ws, node: NodeConn, key: str, sname: str) -> None:
                     c = max(1, min(int(ctl.get("cols", 220)), 1000))
                     r = max(1, min(int(ctl.get("rows", 50)), 1000))
                     _last_size[key] = (c, r)
-                    web_resize(key, cid, c, r)
+                    await web_resize(key, cid, c, r)
             else:
                 # Typing means this client owns the size (same rule as local).
-                st = _attach_state.get(key)
-                if st and st.get("owner") != cid:
-                    st["owner"] = cid
-                    _apply_size(key, st)
+                await web_activate(key, cid)
                 node.send_input(sid, bytes(msg))
 
     tasks = []
     try:
-        web_attach(key, cid, cols, rows)
+        await web_attach(key, cid, cols, rows)
         watches.add(queue)
         if len(watches) == 1:
             await node.send_json({"type": "watch", "sid": sid, "cols": cols, "rows": rows})
@@ -1190,7 +1338,7 @@ async def handle_node_attach(ws, node: NodeConn, key: str, sname: str) -> None:
             except Exception:
                 pass
         try:
-            web_detach(key, cid)
+            await web_detach(key, cid)
         except Exception as error:
             print(f"terminal detach cleanup failed: {type(error).__name__}", file=sys.stderr)
 
@@ -1239,13 +1387,14 @@ async def handle_upload(ws) -> None:
     transfer = None
     complete = False
     try:
-        transfer = UploadTransfer(UPLOAD_DIR, name, size)
+        transfer = await _file_io(UploadTransfer, UPLOAD_DIR, name, size,
+                                  cancel_cleanup=lambda created: created.abort())
         while transfer.received < size:
             message = await asyncio.wait_for(ws.recv(), 60)
             if not isinstance(message, (bytes, bytearray)):
                 raise ValueError("expected upload data")
-            transfer.write(bytes(message))
-        path = transfer.finish()
+            await _file_io(transfer.write, bytes(message))
+        path = await _file_io(transfer.finish)
         complete = True
         await ws.send(json.dumps({"ok": True, "path": path, "size": size}))
     except asyncio.CancelledError:
@@ -1257,7 +1406,7 @@ async def handle_upload(ws) -> None:
             pass
     finally:
         if transfer is not None and not complete:
-            transfer.abort()
+            await _file_io(transfer.abort)
         await ws.close()
 
 
@@ -1390,6 +1539,25 @@ async def handle_tcp_relay(ws) -> None:
 
 
 async def handle_ws(ws) -> None:
+    path = urllib.parse.urlsplit(ws.request.path).path
+    protected = path in ("/ws", "/ws-upload")
+    # HTTP authorization predates websocket.prepare(); a password change can
+    # happen during that await. Recheck immediately before registration.
+    if protected and not request_authed(ws.request):
+        await ws.close(4001, "login expired")
+        return
+    browser = protected and not operator_authed(ws.request)
+    # Track by object identity: adapters are hashable, test fixtures need not be.
+    if browser:
+        _BROWSER_CONNECTIONS[id(ws)] = ws
+    try:
+        await _handle_ws(ws)
+    finally:
+        if browser:
+            _BROWSER_CONNECTIONS.pop(id(ws), None)
+
+
+async def _handle_ws(ws) -> None:
     url = urllib.parse.urlsplit(ws.request.path)
     if url.path == "/ws-node":
         await handle_node_ws(ws)
@@ -1423,7 +1591,7 @@ async def handle_ws(ws) -> None:
     tasks = []
     loop = asyncio.get_running_loop()
     try:
-        web_attach(name, cid, cols, rows)
+        await web_attach(name, cid, cols, rows)
         pid, fd = pty.fork()
         if pid == 0:  # child
             env = RUNTIME.tmux_environment()
@@ -1475,14 +1643,11 @@ async def handle_ws(ws) -> None:
                         rows = max(1, min(int(ctl.get("rows", 50)), 1000))
                         _last_size[name] = (cols, rows)
                         set_winsize(fd, cols, rows)
-                        web_resize(name, cid, cols, rows)
+                        await web_resize(name, cid, cols, rows)
                 else:
                     # Typing/scrolling in a client means that is the screen the
                     # user is actually looking at: it takes over size ownership.
-                    st = _attach_state.get(name)
-                    if st and st.get("owner") != cid:
-                        st["owner"] = cid
-                        _apply_size(name, st)
+                    await web_activate(name, cid)
                     if not writer.write(msg):
                         await ws.send("\r\n[tmux-web] terminal input queue is full or unavailable; input was rejected.\r\n")
 
@@ -1494,7 +1659,7 @@ async def handle_ws(ws) -> None:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         try:
-            web_detach(name, cid)
+            await web_detach(name, cid)
         except Exception as error:
             print(f"terminal detach cleanup failed: {type(error).__name__}", file=sys.stderr)
         if writer is not None:
@@ -1535,6 +1700,7 @@ async def main() -> None:
     _cleanup_uploads()
     _cleanup_pages()
     asyncio.create_task(_page_sweeper())
+    sampler = asyncio.create_task(_stats_sampler())
     runner = web.AppRunner(create_app(sys.modules[__name__]))
     await runner.setup()
     try:
@@ -1542,6 +1708,11 @@ async def main() -> None:
         print(f"tmux-web listening on http://{HOST}:{PORT}", flush=True)
         await asyncio.Future()
     finally:
+        sampler.cancel()
+        await asyncio.gather(sampler, return_exceptions=True)
+        if _STATS_TASK is not None:
+            _STATS_TASK.cancel()
+            await asyncio.gather(_STATS_TASK, return_exceptions=True)
         await runner.cleanup()
 
 
