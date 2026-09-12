@@ -215,5 +215,45 @@ class ProxyTests(unittest.IsolatedAsyncioTestCase):
                 await hub.close()
 
 
+    async def test_legacy_tcp_relay_accepts_query_and_bearer_auth(self):
+        accepted = []
+        async def echo(reader, writer):
+            accepted.append(True)
+            try:
+                while data := await reader.read(4096):
+                    writer.write(data)
+                    await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+        target = await asyncio.start_server(echo, '127.0.0.1', 0)
+        self.addAsyncCleanup(target.wait_closed)
+        self.addCleanup(target.close)
+        port = target.sockets[0].getsockname()[1]
+        secret = secrets.token_urlsafe(24)
+        with patch.object(server, 'node_secret', return_value=secret), patch.object(server, 'BLOCKED_PORTS', set()):
+            hub = TestServer(frontend.create_app(server))
+            await hub.start_server()
+            try:
+                for mode in ('query', 'bearer'):
+                    query = f'/ws-relay?target=127.0.0.1:{port}'
+                    headers = {}
+                    if mode == 'query':
+                        query += '&token=' + secret
+                    else:
+                        headers['Authorization'] = 'Bearer ' + secret
+                    async with self.client.ws_connect(hub.make_url(query), headers=headers) as ws:
+                        await ws.send_bytes(b'\x00relay-contract\xff')
+                        self.assertEqual((await asyncio.wait_for(ws.receive(), 3)).data, b'\x00relay-contract\xff')
+                before = len(accepted)
+                with patch.object(server, 'BLOCKED_PORTS', {port}):
+                    async with self.client.ws_connect(hub.make_url(f'/ws-relay?target=127.0.0.1:{port}&token={secret}')) as ws:
+                        await asyncio.wait_for(ws.receive(), 3)
+                        self.assertEqual(ws.close_code, 4002)
+                self.assertEqual(len(accepted), before)
+            finally:
+                await hub.close()
+
+
 if __name__ == '__main__':
     unittest.main()

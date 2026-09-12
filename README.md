@@ -111,6 +111,8 @@ python3 node.py --server ws://hub-host:59999/ws-node \
 
 ### 开发
 
+候选版本的隔离启动、A/B 对照和历史节点兼容性验收见 [AB_TESTING.md](AB_TESTING.md)。
+
 ```bash
 .venv/bin/python -m unittest discover -v
 ```

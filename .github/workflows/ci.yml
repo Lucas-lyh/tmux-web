@@ -35,4 +35,22 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -S node.py --help
-      - run: python -S -m unittest test_stdlib_crypto test_node_transport test_node_noise -v
+      - run: python -S -m unittest test_stdlib_crypto test_node_transport test_node_noise test_node_lifecycle -v
+
+  ab-compatibility:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update && sudo apt-get install -y tmux
+      - run: python -m pip install -r requirements.txt
+      - run: python scripts/ab_validate.py --baseline 979cc32 --output /tmp/tmux-web-ab-ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ab-compatibility-report
+          path: /tmp/tmux-web-ab-ci/

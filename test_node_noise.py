@@ -284,6 +284,7 @@ class NodeNoiseTests(unittest.IsolatedAsyncioTestCase):
         try:
             hello = json.loads(await asyncio.wait_for(self.independent_receive(peer, independent), 1))
             self.assertEqual(hello, {"type": "hello", "version": 2, "name": agent.name,
+                                     "capabilities": ["file-stat", "file-get-cancel", "file-put-abort", "input-error"],
                                      "sessions": [{"sid": 7, "name": "private-session", "cols": 220, "rows": 50}]})
             await agent.send_binary(node.KIND_OUTPUT, 7, b"private terminal output")
             output = await asyncio.wait_for(self.independent_receive(peer, independent), 1)

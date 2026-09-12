@@ -126,7 +126,7 @@ def rewrite_text(text, content_type, prefix, port):
     return text
 
 
-def response_headers(upstream, prefix, port):
+def response_headers(upstream, prefix, port, auth_cookies=()):
     headers = clean_headers(upstream.headers)
     for key in ('Content-Encoding', 'Set-Cookie', 'Content-Security-Policy',
                 'Content-Security-Policy-Report-Only', 'ETag', 'Content-MD5'):
@@ -140,7 +140,7 @@ def response_headers(upstream, prefix, port):
         try:
             cookie.load(raw)
             for name, morsel in cookie.items():
-                if name == 'tmux_web_token':
+                if name in {'tmux_web_token', *auth_cookies}:
                     continue
                 morsel['domain'] = ''
                 morsel['path'] = map_url(morsel['path'] or '/', prefix, port)
@@ -185,7 +185,7 @@ async def proxy(request, backend):
     if not re.fullmatch(r'[0-9]{1,5}', raw_port) or not 1 <= int(raw_port) <= 65535:
         return web.Response(status=400, text='端口号必须在 1–65535 之间。')
     port = int(raw_port)
-    if port == backend.PORT:
+    if port == backend.PORT or port in getattr(backend, 'BLOCKED_PORTS', ()):
         return web.Response(status=400, text='请填写目标网页的端口，而不是 tmux-web 自身的端口。')
     prefix = f'/port/{raw_port}/'
     if not request.path.startswith(prefix):
@@ -196,8 +196,9 @@ async def proxy(request, backend):
     headers = clean_headers(request.headers)
     headers['Host'] = f'127.0.0.1:{port}'
     headers['Accept-Encoding'] = 'identity'
+    auth_cookies = {'tmux_web_token', getattr(backend, 'COOKIE_NAME', 'tmux_web_token')}
     cookie = '; '.join(part.strip() for part in headers.get('Cookie', '').split(';')
-                       if part.strip() and part.strip().partition('=')[0] != 'tmux_web_token')
+                       if part.strip() and part.strip().partition('=')[0] not in auth_cookies)
     headers.popall('Cookie', None)
     if cookie:
         headers['Cookie'] = cookie
@@ -218,7 +219,7 @@ async def proxy(request, backend):
         async with client.request(request.method, url, headers=headers,
                                   data=request.content.iter_chunked(65536) if request.can_read_body else None,
                                   allow_redirects=False) as upstream:
-            outgoing = response_headers(upstream, prefix, port)
+            outgoing = response_headers(upstream, prefix, port, auth_cookies)
             mime = upstream.content_type
             rewrite = upstream.status != 206 and (mime in ('text/html', 'application/xhtml+xml', 'text/css',
                                                            'application/javascript', 'text/javascript'))

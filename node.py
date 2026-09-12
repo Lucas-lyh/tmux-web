@@ -29,6 +29,7 @@ import argparse
 import asyncio
 import base64
 import contextlib
+from collections import deque
 import hashlib
 import hmac
 import json
@@ -39,6 +40,7 @@ import secrets
 import shutil
 import signal
 import socket
+import stat
 import struct
 import sys
 import tempfile
@@ -64,6 +66,179 @@ KIND_FILE_PUT = 3   # hub -> node: file-put chunk (id = request id)
 BUF_CAP = 256 * 1024          # per-session replay buffer
 CHUNK = 256 * 1024            # file transfer chunk size
 UPLOAD_DIR = "/tmp/tmux-node-uploads"
+MAX_UPLOADS = 32
+UPLOAD_IDLE_TIMEOUT = 15 * 60
+
+
+def ensure_private_upload_root(path: str) -> str:
+    """Open only an owned directory, never a pre-created root symlink."""
+    path = os.path.abspath(path)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    before = os.lstat(path)
+    if not stat.S_ISDIR(before.st_mode) or before.st_uid != os.getuid():
+        raise ValueError("upload root must be a directory owned by the current user")
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(fd)
+        if ((opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+                or opened.st_uid != os.getuid()):
+            raise ValueError("upload root changed during validation")
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+    return path
+
+
+def cleanup_upload_root(path: str, max_age: float = 86400) -> None:
+    """Clean only this user's expired up-* directories below a private root."""
+    root = ensure_private_upload_root(path)
+    cutoff = time.time() - max_age
+    with os.scandir(root) as entries:
+        for entry in entries:
+            if not re.fullmatch(r"up-[A-Za-z0-9_-]+", entry.name):
+                continue
+            try:
+                info = entry.stat(follow_symlinks=False)
+                if (stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+                        and info.st_mtime < cutoff):
+                    shutil.rmtree(entry.path)
+            except FileNotFoundError:
+                pass
+
+
+class UploadTransfer:
+    """One bounded upload; abort is idempotent and never removes a finished file."""
+
+    def __init__(self, root: str, name: str, size: int):
+        if not isinstance(size, int) or size < 0:
+            raise ValueError("upload size must be non-negative")
+        name = os.path.basename(str(name)).strip()[:128] or "file"
+        if name in (".", "..") or "\0" in name:
+            raise ValueError("invalid upload filename")
+        self.size, self.received = size, 0
+        self.updated_at = time.monotonic()
+        self.file = None
+        self._finished = False
+        self.directory = tempfile.mkdtemp(prefix="up-", dir=ensure_private_upload_root(root))
+        self.path = os.path.join(self.directory, name)
+        fd = None
+        try:
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            self.file = os.fdopen(fd, "wb")
+            fd = None
+        except BaseException:
+            if fd is not None:
+                os.close(fd)
+            self.abort()
+            raise
+
+    def write(self, data: bytes) -> None:
+        if self.file is None or self.file.closed:
+            raise ValueError("upload is closed")
+        try:
+            if self.received + len(data) > self.size:
+                raise ValueError("upload exceeds declared size")
+            if self.file.write(data) != len(data):
+                raise OSError("short upload write")
+            self.received += len(data)
+            self.updated_at = time.monotonic()
+        except BaseException:
+            self.abort()
+            raise
+
+    def finish(self) -> str:
+        try:
+            if self.file is None or self.file.closed:
+                raise ValueError("upload is closed")
+            if self.received != self.size:
+                raise ValueError("size mismatch")
+            self.file.close()
+            os.chmod(self.path, 0o600)
+            self._finished = True
+            return self.path
+        except BaseException:
+            self.abort()
+            raise
+
+    def abort(self) -> None:
+        if self._finished:
+            return
+        if self.file is not None:
+            with contextlib.suppress(OSError):
+                self.file.close()
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+
+class PtyWriter:
+    """Bounded nonblocking PTY input. False rejects a whole new input chunk.
+
+    The owner retains the file descriptor and must handle EAGAIN when reading
+    it. close() stops only this writer; it never closes or kills the terminal.
+    """
+
+    def __init__(self, fd: int, *, max_buffer: int = 1024 * 1024):
+        if max_buffer < 1:
+            raise ValueError("PTY input buffer limit must be positive")
+        self.fd, self.max_buffer = fd, max_buffer
+        self.loop = asyncio.get_running_loop()
+        self._queue = deque()
+        self._offset = 0
+        self.pending_bytes = 0
+        self.error = None
+        self._closed = False
+        self._registered = False
+        os.set_blocking(fd, False)
+
+    def write(self, data: bytes) -> bool:
+        if self._closed:
+            raise self.error or BrokenPipeError("PTY input writer is closed")
+        if len(data) + self.pending_bytes > self.max_buffer:
+            return False
+        if data:
+            self._queue.append(bytes(data))
+            self.pending_bytes += len(data)
+            self._flush()
+        if self.error is not None:
+            raise self.error
+        return True
+
+    def _flush(self) -> None:
+        budget = 65536
+        try:
+            while self._queue and budget > 0:
+                first = self._queue[0]
+                try:
+                    count = os.write(self.fd, memoryview(first)[self._offset:self._offset + budget])
+                except InterruptedError:
+                    continue
+                except BlockingIOError:
+                    break
+                if count <= 0:
+                    raise BrokenPipeError("PTY input writer made no progress")
+                self._offset += count
+                self.pending_bytes -= count
+                budget -= count
+                if self._offset == len(first):
+                    self._queue.popleft()
+                    self._offset = 0
+            if self._queue and not self._registered:
+                self.loop.add_writer(self.fd, self._flush)
+                self._registered = True
+            elif not self._queue and self._registered:
+                self.loop.remove_writer(self.fd)
+                self._registered = False
+        except OSError as exc:
+            self.error = exc
+            self.close()
+
+    def close(self) -> None:
+        self._closed = True
+        if self._registered:
+            with contextlib.suppress(Exception):
+                self.loop.remove_writer(self.fd)
+            self._registered = False
+        self._queue.clear()
+        self._offset = self.pending_bytes = 0
 
 
 def set_winsize(fd: int, cols: int, rows: int) -> None:
@@ -782,6 +957,8 @@ class Session:
     """One shell in a pty, with a replay buffer and a fan-out queue."""
 
     def __init__(self, agent: "Agent", sid: int, name: str, cols: int, rows: int):
+        if not 1 <= cols <= 65535 or not 1 <= rows <= 65535:
+            raise ValueError("terminal dimensions must be between 1 and 65535")
         self.agent = agent
         self.sid = sid
         self.name = name
@@ -790,6 +967,8 @@ class Session:
         self.watchers = 0
         self.outq: asyncio.Queue = asyncio.Queue(maxsize=512)
         self.dead = False
+        self.input_writer = None
+        self.sender = None
         loop = asyncio.get_running_loop()
         self.pid, self.fd = pty.fork()
         if self.pid == 0:  # child
@@ -799,13 +978,28 @@ class Session:
                 os.execvpe(shell, [shell, "-l"], env)
             finally:
                 os._exit(127)
-        set_winsize(self.fd, cols, rows)
-        loop.add_reader(self.fd, self._on_read)
-        self.sender = asyncio.create_task(self._send_loop())
+        try:
+            set_winsize(self.fd, cols, rows)
+            self.input_writer = PtyWriter(self.fd)
+            loop.add_reader(self.fd, self._on_read)
+            self.sender = asyncio.create_task(self._send_loop())
+        except BaseException:
+            with contextlib.suppress(Exception):
+                loop.remove_reader(self.fd)
+            if self.input_writer is not None:
+                self.input_writer.close()
+            with contextlib.suppress(OSError):
+                os.close(self.fd)
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(self.pid, signal.SIGKILL)
+            asyncio.create_task(self._reap())
+            raise
 
     def _on_read(self) -> None:
         try:
             data = os.read(self.fd, 65536)
+        except (BlockingIOError, InterruptedError):
+            return
         except OSError:
             data = b""
         if data:
@@ -822,9 +1016,9 @@ class Session:
             asyncio.create_task(self._finish(notify=True))
 
     async def _send_loop(self) -> None:
-        while True:
+        while not getattr(self, "dead", False):
             item = await self.outq.get()
-            if item is None:
+            if item is None or getattr(self, "dead", False):
                 return
             try:
                 await self.agent.send_binary(KIND_OUTPUT, self.sid, item)
@@ -839,15 +1033,18 @@ class Session:
         except ProcessLookupError:
             pass
         loop = asyncio.get_running_loop()
+        waiter = loop.run_in_executor(None, os.waitpid, self.pid, 0)
         try:
-            await asyncio.wait_for(
-                loop.run_in_executor(None, os.waitpid, self.pid, 0), 5)
-        except (asyncio.TimeoutError, ChildProcessError):
+            await asyncio.wait_for(asyncio.shield(waiter), 5)
+        except asyncio.TimeoutError:
             try:
                 os.kill(self.pid, signal.SIGKILL)
-                await loop.run_in_executor(None, os.waitpid, self.pid, 0)
-            except (ChildProcessError, ProcessLookupError):
+            except ProcessLookupError:
                 pass
+            with contextlib.suppress(ChildProcessError):
+                await waiter
+        except ChildProcessError:
+            pass
 
     async def _finish(self, notify: bool) -> None:
         if self.dead:
@@ -858,14 +1055,30 @@ class Session:
             loop.remove_reader(self.fd)
         except Exception:
             pass
-        try:
-            self.outq.put_nowait(None)
-        except asyncio.QueueFull:
-            pass
+        if self.input_writer is not None:
+            self.input_writer.close()
+        while not self.outq.empty():
+            self.outq.get_nowait()
+        self.outq.put_nowait(None)
         try:
             os.close(self.fd)
         except OSError:
             pass
+        cancelled = False
+        if self.sender is not None and self.sender is not asyncio.current_task():
+            try:
+                # Let an in-flight encrypted message finish before stopping;
+                # cancelling it midway would invalidate the shared channel.
+                await asyncio.wait_for(asyncio.shield(self.sender), 3)
+            except asyncio.TimeoutError:
+                self.sender.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.sender
+            except asyncio.CancelledError:
+                cancelled = True
+                self.sender.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.sender
         await self._reap()
         self.agent.sessions.pop(self.sid, None)
         if notify:
@@ -873,11 +1086,15 @@ class Session:
                 await self.agent.send_json({"type": "exit", "sid": self.sid})
             except Exception:
                 pass
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def kill(self) -> None:
         await self._finish(notify=False)
 
     def resize(self, cols: int, rows: int) -> None:
+        if not 1 <= cols <= 65535 or not 1 <= rows <= 65535:
+            return
         self.cols, self.rows = cols, rows
         if not self.dead:
             try:
@@ -906,7 +1123,10 @@ class Agent:
         self.sessions: dict[int, Session] = {}
         self.next_sid = 0
         self.ws: NodeConnection | None = None
-        self.puts: dict[int, dict] = {}  # file-put transfers in flight
+        self.puts: dict[int, UploadTransfer] = {}
+        self._file_tasks = {}
+        self._download_cancels = {}
+        self._last_upload_sweep = 0.0
 
     async def maybe_portal_login(self) -> None:
         """The server link is down; if a campus captive portal is the cause,
@@ -956,9 +1176,11 @@ class Agent:
             except Exception as e:
                 print(f"[node] error: {type(e).__name__}")
             finally:
-                if self.ws:
-                    await self.ws.close()
+                old_connection = self.ws
                 self.ws = None
+                if old_connection:
+                    await old_connection.close()
+                await self._reset_transfers()
                 # sessions keep running locally; the hub will re-watch after
                 # we reconnect and re-hello with the session list.
                 for s in self.sessions.values():
@@ -972,12 +1194,14 @@ class Agent:
     async def serve(self) -> None:
         await self.send_json({
             "type": "hello", "version": PROTO_VERSION, "name": self.name,
+            "capabilities": ["file-stat", "file-get-cancel", "file-put-abort", "input-error"],
             "sessions": [{"sid": s.sid, "name": s.name, "cols": s.cols, "rows": s.rows}
                          for s in self.sessions.values()],
         })
         recv_task = None
         try:
             while True:
+                self._expire_uploads()
                 if recv_task is None:
                     recv_task = asyncio.create_task(self.ws.recv())
                 try:
@@ -1005,9 +1229,13 @@ class Agent:
                         s = self.sessions.get(rid)
                         if s and not s.dead:
                             try:
-                                os.write(s.fd, payload)
+                                accepted = s.input_writer.write(payload)
+                                error = "Terminal input buffer is full; try a smaller paste." if not accepted else None
                             except OSError:
-                                pass
+                                error = "Terminal input is unavailable."
+                            if error and time.monotonic() - getattr(s, "last_input_error", 0) >= 1:
+                                s.last_input_error = time.monotonic()
+                                await self.send_json({"type": "input-error", "sid": rid, "error": error})
                     elif kind == KIND_FILE_PUT:
                         await self._put_chunk(rid, payload)
         finally:
@@ -1015,6 +1243,7 @@ class Agent:
                 recv_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await recv_task
+            await self._reset_transfers()
 
     # -- control messages ---------------------------------------------------
     async def handle(self, msg: dict) -> None:
@@ -1048,11 +1277,19 @@ class Agent:
         elif t == "resolve":
             await self._resolve(msg)
         elif t == "file-get":
-            asyncio.create_task(self._file_get(msg))
+            await self._start_file_get(msg)
+        elif t == "file-stat":
+            await self._file_stat(msg)
+        elif t == "file-get-cancel":
+            cancelled = self._download_cancels.get(msg.get("id"))
+            if cancelled is not None:
+                cancelled.set()
         elif t == "file-put":
-            self._put_start(msg)
+            await self._put_start(msg)
         elif t == "file-put-done":
             await self._put_done(msg)
+        elif t == "file-put-abort":
+            self._abort_upload(msg.get("id"))
 
     async def _new(self, msg: dict) -> None:
         rid = msg.get("id")
@@ -1118,81 +1355,159 @@ class Agent:
                                   "name": os.path.basename(os.path.realpath(found))})
 
     # -- file transfer ------------------------------------------------------
-    async def _file_get(self, msg: dict) -> None:
+    async def _start_file_get(self, msg: dict) -> None:
         rid = msg.get("id")
-        p = str(msg.get("path", ""))
-        if p.startswith("~"):
-            p = os.path.expanduser(p)
-        rp = os.path.realpath(p)
+        previous = self._file_tasks.get(rid)
+        if previous is not None:
+            self._download_cancels[rid].set()
+            try:
+                await asyncio.wait_for(asyncio.shield(previous), 3)
+            except asyncio.TimeoutError:
+                previous.cancel()
+                await asyncio.gather(previous, return_exceptions=True)
+        cancelled = asyncio.Event()
+        task = asyncio.create_task(self._file_get(msg, self.ws, cancelled))
+        self._file_tasks[rid] = task
+        self._download_cancels[rid] = cancelled
+
+        def finished(done):
+            if self._file_tasks.get(rid) is done:
+                self._file_tasks.pop(rid, None)
+                self._download_cancels.pop(rid, None)
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                done.result()
+        task.add_done_callback(finished)
+
+    @staticmethod
+    def _download_path(msg: dict) -> str:
+        path = str(msg.get("path", ""))
+        if path.startswith("~"):
+            path = os.path.expanduser(path)
+        if not os.path.isabs(path):
+            raise FileNotFoundError("not a file")
+        return os.path.realpath(path)
+
+    async def _file_stat(self, msg: dict) -> None:
+        connection = self.ws
+        if connection is None:
+            return
         try:
-            if not p.startswith("/") or not os.path.isfile(rp):
+            path = self._download_path(msg)
+            info = os.stat(path)
+            if not stat.S_ISREG(info.st_mode):
                 raise FileNotFoundError("not a file")
-            size = os.path.getsize(rp)
-            await self.send_json({"type": "file-meta", "id": rid, "ok": True,
-                                  "size": size, "name": os.path.basename(rp)})
-            with open(rp, "rb") as f:
+            reply = {"type": "file-meta", "id": msg.get("id"), "ok": True,
+                     "size": info.st_size, "name": os.path.basename(path)}
+        except (OSError, ValueError) as exc:
+            reply = {"type": "file-meta", "id": msg.get("id"), "ok": False, "error": str(exc)}
+        await connection.send_json(reply)
+
+    async def _file_get(self, msg: dict, connection=None, cancelled=None) -> None:
+        rid = msg.get("id")
+        connection = self.ws if connection is None else connection
+        if connection is None:
+            return
+        cancelled = cancelled or asyncio.Event()
+        try:
+            path = self._download_path(msg)
+            # Open nonblocking so a file replaced by a FIFO cannot hang the
+            # event loop; metadata is then tied to this exact open file.
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                stream = os.fdopen(fd, "rb")
+            except BaseException:
+                os.close(fd)
+                raise
+            with stream as f:
+                info = os.fstat(f.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    raise FileNotFoundError("not a file")
+                if cancelled.is_set() or self.ws is not connection:
+                    return
+                await connection.send_json({"type": "file-meta", "id": rid, "ok": True,
+                                            "size": info.st_size, "name": os.path.basename(path)})
                 while True:
+                    if cancelled.is_set() or self.ws is not connection:
+                        return
                     chunk = f.read(CHUNK)
                     if not chunk:
                         break
-                    await self.send_binary(KIND_FILE_DATA, rid, chunk)
-            await self.send_json({"type": "file-end", "id": rid})
+                    await connection.send_binary(KIND_FILE_DATA, rid, chunk)
+                    await asyncio.sleep(0)
+            if not cancelled.is_set() and self.ws is connection:
+                await connection.send_json({"type": "file-end", "id": rid})
         except Exception as e:
-            await self.send_json({"type": "file-meta", "id": rid, "ok": False,
-                                  "error": str(e)})
+            if not cancelled.is_set() and self.ws is connection:
+                with contextlib.suppress(Exception):
+                    await connection.send_json({"type": "file-meta", "id": rid, "ok": False,
+                                                "error": str(e)})
 
-    def _put_start(self, msg: dict) -> None:
+    async def _put_start(self, msg: dict) -> None:
         rid = msg.get("id")
-        name = os.path.basename(str(msg.get("name", ""))).strip()[:128] or "file"
+        self._abort_upload(rid)
+        self._expire_uploads()
         try:
+            if len(self.puts) >= MAX_UPLOADS:
+                raise ValueError("too many unfinished uploads")
             size = int(msg.get("size", -1))
-            os.makedirs(UPLOAD_DIR, exist_ok=True)
-            updir = tempfile.mkdtemp(prefix="up-", dir=UPLOAD_DIR)
-            os.chmod(updir, 0o700)
-            path = os.path.join(updir, name)
-            self.puts[rid] = {"f": open(path, "wb"), "path": path,
-                              "size": size, "received": 0}
+            self.puts[rid] = UploadTransfer(UPLOAD_DIR, msg.get("name", ""), size)
         except Exception as e:
-            self.puts.pop(rid, None)
-            asyncio.create_task(self.send_json(
-                {"type": "ack", "id": rid, "ok": False, "error": str(e)}))
+            await self.send_json({"type": "ack", "id": rid, "ok": False, "error": str(e)})
 
     async def _put_chunk(self, rid: int, payload: bytes) -> None:
-        st = self.puts.get(rid)
-        if not st:
+        transfer = self.puts.get(rid)
+        if transfer is None:
             return
-        st["f"].write(payload)
-        st["received"] += len(payload)
+        try:
+            transfer.write(payload)
+        except Exception as exc:
+            self._abort_upload(rid)
+            await self.send_json({"type": "ack", "id": rid, "ok": False, "error": str(exc)})
 
     async def _put_done(self, msg: dict) -> None:
         rid = msg.get("id")
-        st = self.puts.pop(rid, None)
-        if not st:
+        transfer = self.puts.pop(rid, None)
+        if transfer is None:
             await self.send_json({"type": "ack", "id": rid, "ok": False,
                                   "error": "no such transfer"})
             return
-        st["f"].close()
-        if st["received"] != st["size"]:
-            shutil.rmtree(os.path.dirname(st["path"]), ignore_errors=True)
-            await self.send_json({"type": "ack", "id": rid, "ok": False,
-                                  "error": "size mismatch"})
+        try:
+            path = transfer.finish()
+        except Exception as exc:
+            await self.send_json({"type": "ack", "id": rid, "ok": False, "error": str(exc)})
             return
-        os.chmod(st["path"], 0o600)
-        await self.send_json({"type": "ack", "id": rid, "ok": True, "path": st["path"]})
+        await self.send_json({"type": "ack", "id": rid, "ok": True, "path": path})
+
+    def _abort_upload(self, rid) -> None:
+        transfer = self.puts.pop(rid, None)
+        if transfer is not None:
+            transfer.abort()
+
+    def _expire_uploads(self) -> None:
+        now = time.monotonic()
+        if now - self._last_upload_sweep < 30:
+            return
+        self._last_upload_sweep = now
+        for rid, transfer in list(self.puts.items()):
+            if now - transfer.updated_at > UPLOAD_IDLE_TIMEOUT:
+                self._abort_upload(rid)
+
+    async def _reset_transfers(self) -> None:
+        tasks = list(self._file_tasks.values())
+        for cancelled in self._download_cancels.values():
+            cancelled.set()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._file_tasks.clear()
+        self._download_cancels.clear()
+        for rid in list(self.puts):
+            self._abort_upload(rid)
 
 
 def cleanup_uploads() -> None:
-    try:
-        now = time.time()
-        for d in os.listdir(UPLOAD_DIR):
-            p = os.path.join(UPLOAD_DIR, d)
-            try:
-                if now - os.path.getmtime(p) > 86400:
-                    shutil.rmtree(p, ignore_errors=True)
-            except OSError:
-                pass
-    except OSError:
-        pass
+    cleanup_upload_root(UPLOAD_DIR)
 
 
 async def main() -> None:
@@ -1238,7 +1553,10 @@ async def main() -> None:
             ap.error("--portal-url must be an http:// or https:// base URL")
         if portal.username or portal.password or portal.query or portal.fragment:
             ap.error("--portal-url must not include credentials, a query or a fragment")
-    cleanup_uploads()
+    try:
+        cleanup_uploads()
+    except (OSError, ValueError) as exc:
+        ap.error(f"cannot prepare private upload directory: {type(exc).__name__}")
     agent = Agent(args.server, args.token, args.name,
                   args.portal_user, args.portal_pass, args.portal_url, args.portal_insecure)
     await agent.run()
