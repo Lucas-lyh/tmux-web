@@ -77,6 +77,7 @@ def browser_shim(prefix, port):
   const prefix = PREFIX, port = PORT;
   function route(value) {
     const u = new URL(String(value), location.href);
+    if (!['http:', 'https:', 'ws:', 'wss:'].includes(u.protocol)) return u.href;
     const local = (['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname) || u.hostname === location.hostname) && Number(u.port || 80) === port;
     if (u.origin === location.origin || local ||
         (['ws:', 'wss:'].includes(u.protocol) && u.host === location.host)) {
@@ -86,6 +87,36 @@ def browser_shim(prefix, port):
     }
     return u.href;
   }
+  // Plugin loaders often use script.src (or setAttribute), bypassing fetch.
+  // Rewrite actual DOM URL assignments without touching application strings.
+  const resources = [
+    ['HTMLScriptElement', ['src']], ['HTMLLinkElement', ['href']],
+    ['HTMLImageElement', ['src']], ['HTMLSourceElement', ['src']],
+    ['HTMLVideoElement', ['src', 'poster']], ['HTMLAudioElement', ['src']],
+    ['HTMLTrackElement', ['src']], ['HTMLIFrameElement', ['src']],
+    ['HTMLInputElement', ['src']], ['HTMLFormElement', ['action']],
+    ['HTMLAnchorElement', ['href']]
+  ];
+  const urlAttributes = [];
+  for (const [name, attributes] of resources) {
+    const Type = window[name];
+    if (!Type) continue;
+    urlAttributes.push([Type, attributes]);
+    for (const attribute of attributes) {
+      let owner = Type.prototype, descriptor;
+      while (owner && !(descriptor = Object.getOwnPropertyDescriptor(owner, attribute))) owner = Object.getPrototypeOf(owner);
+      if (!descriptor || !descriptor.set || !descriptor.configurable) continue;
+      Object.defineProperty(Type.prototype, attribute, {...descriptor,
+        set(value) { descriptor.set.call(this, route(value)); }
+      });
+    }
+  }
+  const setAttribute = Element.prototype.setAttribute;
+  Element.prototype.setAttribute = function(name, value) {
+    const attribute = String(name).toLowerCase();
+    if (urlAttributes.some(([Type, attributes]) => this instanceof Type && attributes.includes(attribute))) value = route(value);
+    return setAttribute.call(this, name, value);
+  };
   const originalFetch = window.fetch;
   window.fetch = function(input, init) {
     return originalFetch.call(this, input instanceof Request ? new Request(route(input.url), input) : route(input), init);

@@ -162,6 +162,50 @@ class PostAdapterTests(unittest.IsolatedAsyncioTestCase):
 
 class BrowserBehaviorTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('node'), 'JavaScript runtime unavailable')
+    def test_plugin_loader_dom_urls_use_proxy_without_changing_module_ids(self):
+        shim = frontend.browser_shim('/port/3080/', 3080).split('>', 1)[1].rsplit('</script>', 1)[0]
+        fixture = r'''
+const assert = require('node:assert/strict'), vm = require('node:vm');
+class Element {
+  constructor() { this.attributes = {}; }
+  setAttribute(name, value) { this.attributes[String(name).toLowerCase()] = value; }
+}
+class Script extends Element {}
+class Link extends Element {}
+class Media extends Element {}
+class Video extends Media {}
+for (const [Type, property] of [[Script,'src'],[Link,'href'],[Media,'src']]) {
+  Object.defineProperty(Type.prototype, property, {configurable:true, enumerable:true,
+    get() { return this.attributes[property]; }, set(value) { this.attributes[property] = value; }});
+}
+const sandbox = {URL, Request, Element, HTMLScriptElement:Script, HTMLLinkElement:Link,
+  HTMLVideoElement:Video, location:new URL('http://fixture:59999/port/3080/'),
+  XMLHttpRequest:class {open(){}}, history:{pushState(){},replaceState(){}}, navigator:{}, fetch(){}};
+sandbox.window = sandbox;
+vm.runInNewContext(SHIM, sandbox);
+const script = new Script();
+script.src = '/plugins/??example/client.js';
+assert.equal(script.src, 'http://fixture:59999/port/3080/plugins/??example/client.js');
+script.setAttribute('SRC', '/plugins/entry.js');
+assert.equal(script.src, 'http://fixture:59999/port/3080/plugins/entry.js');
+script.src = '/port/3080/plugins/entry.js';
+assert.equal(script.src, 'http://fixture:59999/port/3080/plugins/entry.js');
+script.src = 'https://external.invalid/plugin.js';
+assert.equal(script.src, 'https://external.invalid/plugin.js');
+script.src = 'blob:http://fixture:59999/fixture-id';
+assert.equal(script.src, 'blob:http://fixture:59999/fixture-id');
+script.setAttribute('data-module', 'example/client');
+assert.equal(script.attributes['data-module'], 'example/client');
+const link = new Link(); link.href = '/plugins/theme.css';
+assert.equal(link.href, 'http://fixture:59999/port/3080/plugins/theme.css');
+const video = new Video(); video.src = '/media/clip.mp4';
+assert.equal(video.src, 'http://fixture:59999/port/3080/media/clip.mp4');
+'''
+        result = subprocess.run(['node', '-e', 'const SHIM=' + json.dumps(shim) + ';\n' + fixture],
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which('node'), 'JavaScript runtime unavailable')
     def test_browser_regressions(self):
         result = subprocess.run(['node', str(Path(__file__).with_suffix('.js'))],
                                 capture_output=True, text=True, timeout=20)
