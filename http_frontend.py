@@ -123,9 +123,74 @@ def browser_shim(prefix, port):
   };
   const open = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function(method, url, ...rest) { return open.call(this, method, route(url), ...rest); };
-  for (const name of ['WebSocket', 'EventSource', 'Worker', 'SharedWorker']) {
+  for (const name of ['WebSocket', 'EventSource', 'SharedWorker']) {
     const Original = window[name];
     if (Original) window[name] = new Proxy(Original, {construct(Target, args) { args[0] = route(args[0]); return Reflect.construct(Target, args); }});
+  }
+  // Blob Workers have a separate global: page fetch/XHR hooks do not apply.
+  // Keep the original Blob until revocation so a classic worker can install
+  // its network hooks before importScripts, preserving the source's directives.
+  function workerNetwork(scope, prefix, port, page) {
+    const base = new URL(page);
+    function map(value) {
+      const u = new URL(String(value), base);
+      if (!['http:', 'https:', 'ws:', 'wss:'].includes(u.protocol)) return u.href;
+      const local = (['127.0.0.1', 'localhost', '[::1]', base.hostname].includes(u.hostname)) && Number(u.port || 80) === port;
+      if (u.origin === base.origin || local || (['ws:', 'wss:'].includes(u.protocol) && u.host === base.host)) {
+        if (!u.pathname.startsWith(prefix)) u.pathname = prefix.slice(0, -1) + u.pathname;
+        u.host = base.host;
+        u.protocol = ['ws:', 'wss:'].includes(u.protocol) ? (base.protocol === 'https:' ? 'wss:' : 'ws:') : base.protocol;
+      }
+      return u.href;
+    }
+    const originalFetch = scope.fetch;
+    scope.fetch = function(input, init) {
+      return originalFetch.call(this, input instanceof Request ? new Request(map(input.url), input) : map(input), init);
+    };
+    if (scope.XMLHttpRequest) {
+      const open = scope.XMLHttpRequest.prototype.open;
+      scope.XMLHttpRequest.prototype.open = function(method, url, ...rest) { return open.call(this, method, map(url), ...rest); };
+    }
+    for (const name of ['WebSocket', 'EventSource']) {
+      const Original = scope[name];
+      if (Original) scope[name] = new Proxy(Original, {construct(Target, args) { args[0] = map(args[0]); return Reflect.construct(Target, args); }});
+    }
+    const load = scope.importScripts;
+    scope.importScripts = (...urls) => load.apply(scope, urls.map(map));
+  }
+  if (window.Worker && URL.createObjectURL && URL.revokeObjectURL) {
+    const blobs = new Map(), create = URL.createObjectURL.bind(URL), revoke = URL.revokeObjectURL.bind(URL);
+    URL.createObjectURL = function(value) {
+      const url = create(value);
+      if (value instanceof Blob) blobs.set(url, value);
+      return url;
+    };
+    URL.revokeObjectURL = function(url) { blobs.delete(String(url)); return revoke(url); };
+    window.Worker = new Proxy(window.Worker, {construct(Target, args, NewTarget) {
+      const blob = blobs.get(String(args[0]));
+      if (!blob || (args[1] && args[1].type === 'module')) {
+        args[0] = route(args[0]);
+        return Reflect.construct(Target, args, NewTarget);
+      }
+      const source = create(blob);
+      const setup = '(' + workerNetwork.toString() + ')(self,' + JSON.stringify(prefix) + ',' + port + ',' + JSON.stringify(location.href) + ');';
+      const bootstrap = create(new Blob([
+        'try {' + setup + 'importScripts(' + JSON.stringify(source) + ');}' +
+        'finally { URL.revokeObjectURL(' + JSON.stringify(source) + '); }'
+      ], {type:'text/javascript'}));
+      try {
+        args[0] = bootstrap;
+        const worker = Reflect.construct(Target, args, NewTarget), terminate = worker.terminate;
+        worker.terminate = function(...values) { revoke(source); return terminate.apply(this, values); };
+        worker.addEventListener('error', () => revoke(source), {once:true});
+        return worker;
+      } catch (error) {
+        revoke(source);
+        throw error;
+      } finally {
+        revoke(bootstrap);
+      }
+    }});
   }
   for (const name of ['pushState', 'replaceState']) {
     const original = history[name];

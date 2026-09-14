@@ -162,6 +162,13 @@ class PostAdapterTests(unittest.IsolatedAsyncioTestCase):
 
 class BrowserBehaviorTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('node'), 'JavaScript runtime unavailable')
+    def test_blob_worker_upload_routing_and_cleanup(self):
+        shim = frontend.browser_shim('/port/3080/', 3080).split('>', 1)[1].rsplit('</script>', 1)[0]
+        result = subprocess.run(['node', str(Path(__file__).with_name('test_proxy_worker.js'))],
+                                input=shim, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    @unittest.skipUnless(shutil.which('node'), 'JavaScript runtime unavailable')
     def test_plugin_loader_dom_urls_use_proxy_without_changing_module_ids(self):
         shim = frontend.browser_shim('/port/3080/', 3080).split('>', 1)[1].rsplit('</script>', 1)[0]
         fixture = r'''
