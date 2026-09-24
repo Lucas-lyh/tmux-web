@@ -604,6 +604,8 @@ async def proxy(request, backend):
 
 def create_app(backend):
     app = web.Application(client_max_size=1024**3)
+    from hub.http_poll import install
+    install(app, backend)
 
     async def lifecycle(app):
         async with aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar(),

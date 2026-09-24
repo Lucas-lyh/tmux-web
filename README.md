@@ -143,3 +143,22 @@ export no_proxy=localhost,127.0.0.1,::1
 ```
 
 [MIT License](LICENSE) · Built for terminals, humans & agents.
+
+### HTTP 代理不支持 CONNECT / WebSocket 时
+
+给原节点启动命令追加 `--onlyhttp`：
+
+```bash
+http_proxy=http://PROXY_HOST:3128 python3 -S node.py \
+  --server ws://HUB_HOST:59999/ws-node --token-file /path/to/node.token --onlyhttp
+```
+
+`--server` 仍使用原来的 `ws://` 地址，凭据缓存也沿用原地址；此模式实际访问同一主机的
+`http://HUB_HOST:59999/node-http/*`。节点使用 Python 标准库发送普通 HTTP POST 请求，
+不发送 CONNECT 或 WebSocket Upgrade。代理设置与普通模式一致，读取 `http_proxy` / `all_proxy`
+（及其大写形式），遵循 `no_proxy`。请同时更新主服务器和远端 `node.py`。
+
+上传和接收使用独立请求，接收请求最多等待 15 秒，有数据时立即返回。节点凭据、终端数据和文件
+继续通过原有 Noise 协议加密；HTTP 元数据仍对代理可见。代理必须允许这些路径的 POST 和二进制正文。
+轮询有额外 HTTP 开销。网络响应丢失时会断开并重新完成加密握手，不自动重放旧输入；本地 shell
+会话保留，但断线时在途输入可能丢失。默认不加参数时仍使用 WebSocket。

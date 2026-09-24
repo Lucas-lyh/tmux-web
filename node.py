@@ -1139,6 +1139,80 @@ class WsRaw:
         await self.ws.close()
 
 
+class HttpPollRaw:
+    """Standard-library HTTP POST long polling, without CONNECT or Upgrade."""
+
+    def __init__(self, url):
+        self.endpoint = validate_server_url(url)
+        self.proxy = node_proxy(self.endpoint)
+        self.sid = ''
+        self.closed = False
+        self.last_seen = time.time()
+        self.sequences = {'send': 0, 'recv': 0}
+
+    def _request(self, action, data=b'', seq=None):
+        import http.client
+        u, proxy = self.endpoint, self.proxy
+        authority = ('[' + u.hostname + ']' if ':' in u.hostname else u.hostname) + ':' + str(u.port or 80)
+        query = {'sid': self.sid} if self.sid else dict(urllib.parse.parse_qsl(u.query))
+        if seq is not None:
+            query['seq'] = str(seq)
+        path = '/node-http/' + action + '?' + urllib.parse.urlencode(query)
+        headers = {'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-store',
+                   'Host': authority, 'Connection': 'close'}
+        if proxy and proxy.username is not None:
+            credentials = urllib.parse.unquote(proxy.username) + ':' + urllib.parse.unquote(proxy.password or '')
+            headers['Proxy-Authorization'] = 'Basic ' + base64.b64encode(credentials.encode()).decode('ascii')
+        conn = http.client.HTTPConnection(proxy.hostname if proxy else u.hostname,
+                                         (proxy.port or 80) if proxy else (u.port or 80), timeout=30)
+        try:
+            conn.request('POST', 'http://' + authority + path if proxy else path, body=data, headers=headers)
+            response = conn.getresponse()
+            body = response.read(NOISE_MAX_RECORD + 1)
+            if response.status not in (200, 204) or len(body) > NOISE_MAX_RECORD:
+                raise ConnectionError(f'HTTP polling failed (HTTP {response.status})')
+            return body
+        finally:
+            conn.close()
+
+    @classmethod
+    async def connect(cls, url):
+        raw = cls(url)
+        sid = await asyncio.to_thread(raw._request, 'open')
+        if not re.fullmatch(rb'[0-9a-f]{64}', sid):
+            raise ConnectionError('invalid HTTP polling session')
+        raw.sid = sid.decode('ascii')
+        return raw
+
+    async def send(self, data):
+        if self.closed:
+            raise ConnectionError('HTTP polling closed')
+        seq = self.sequences['send']
+        self.sequences['send'] += 1
+        await asyncio.to_thread(self._request, 'send', data, seq)
+
+    async def recv(self):
+        while not self.closed:
+            seq = self.sequences['recv']
+            self.sequences['recv'] += 1
+            data = await asyncio.to_thread(self._request, 'recv', b'', seq)
+            self.last_seen = time.time()
+            if data:
+                return data
+        raise ConnectionError('HTTP polling closed')
+
+    async def send_frame(self, opcode, data):
+        # Poll responses supply liveness; no WebSocket control frames exist here.
+        if opcode not in (9, 10) or data:
+            raise ValueError('invalid HTTP transport probe')
+
+    async def close(self, code=1000, reason=''):
+        if not self.closed:
+            self.closed = True
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(asyncio.to_thread(self._request, 'close'), 3)
+
+
 class NodeConnection:
     """Keep Agent's terminal/file API while encrypting every application message."""
 
@@ -1322,10 +1396,11 @@ class Session:
 class Agent:
     def __init__(self, server: str, token: str, name: str,
                  portal_user: str = "", portal_pass: str = "",
-                 portal_url: str = "", portal_insecure: bool = False):
+                 portal_url: str = "", portal_insecure: bool = False, onlyhttp: bool = False):
         validate_server_url(server)
         validate_node_token(token)
         self.server = server
+        self.onlyhttp = onlyhttp
         self.name = name
         self.token = load_node_credential(server, name, token)
         self._refresh_node_url()
@@ -1404,9 +1479,10 @@ class Agent:
                 self.token = load_node_credential(self.server, self.name, self.token)
                 self._refresh_node_url()
                 print(f"[node] connecting to {urllib.parse.urlsplit(self.server).hostname} as {self.name!r} ...")
-                raw_ws = await asyncio.wait_for(Ws.connect(
-                    self.node_url), 40)
-                channel = await NoiseChannel.establish(WsRaw(raw_ws), self.token, initiator=True)
+                transport = HttpPollRaw if self.onlyhttp else Ws
+                raw_ws = await asyncio.wait_for(transport.connect(self.node_url), 40)
+                raw = raw_ws if self.onlyhttp else WsRaw(raw_ws)
+                channel = await NoiseChannel.establish(raw, self.token, initiator=True)
                 self.ws = NodeConnection(raw_ws, channel)
                 await self.serve()
             except CredentialError:
@@ -1787,6 +1863,8 @@ async def main() -> None:
     ap = argparse.ArgumentParser(description="tmux-web child node (no tmux required)")
     ap.add_argument("--server", required=True,
                     help="node endpoint, e.g. ws://host:59999/ws-node (always Noise encrypted)")
+    ap.add_argument("--onlyhttp", action="store_true",
+                    help="use HTTP POST long polling instead of WebSocket (no proxy CONNECT)")
     credentials = ap.add_mutually_exclusive_group()
     credentials.add_argument("--token", help="the server's node secret")
     credentials.add_argument("--token-file", help="read the node secret from this file")
@@ -1832,7 +1910,7 @@ async def main() -> None:
         ap.error(f"cannot prepare private upload directory: {type(exc).__name__}")
     try:
         agent = Agent(args.server, args.token, args.name,
-                      args.portal_user, args.portal_pass, args.portal_url, args.portal_insecure)
+                      args.portal_user, args.portal_pass, args.portal_url, args.portal_insecure, args.onlyhttp)
     except CredentialError as exc:
         ap.error(str(exc))
     await agent.run()
