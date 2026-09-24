@@ -287,6 +287,17 @@ def login_succeeded(ip: str) -> None:
 
 INDEX_HTML = RUNTIME.read_asset("index.html")
 
+# Only these bundled public assets are exposed; URL paths never select disk files.
+VENDOR_ASSETS = {
+    "/static/" + name: (RUNTIME.read_asset(name), content_type)
+    for name, content_type in (
+        ("vendor/xterm-5.3.0/xterm.min.css", "text/css; charset=utf-8"),
+        ("vendor/xterm-5.3.0/xterm.min.js", "application/javascript; charset=utf-8"),
+        ("vendor/xterm-addon-fit-0.8.0/xterm-addon-fit.min.js", "application/javascript; charset=utf-8"),
+        ("vendor/chart.js-4.4.1/chart.umd.min.js", "application/javascript; charset=utf-8"),
+    )
+}
+
 LOGIN_HTML = RUNTIME.read_asset("login.html")
 
 
@@ -631,6 +642,14 @@ def _read_local_download(path):
 async def process_request(connection, request):
     url = urllib.parse.urlsplit(request.path)
     path, query = url.path, urllib.parse.parse_qs(url.query)
+
+    if path.startswith("/static/"):
+        asset = VENDOR_ASSETS.get(path)
+        if asset is None:
+            return http_response(404, "not found\n", "text/plain; charset=utf-8")
+        body, content_type = asset
+        return http_response(200, body, content_type,
+                             {"Cache-Control": "public, max-age=31536000, immutable"})
 
     if path == "/node.py":
         return http_response(200, node_script_bytes().decode("utf-8"), "text/x-python; charset=utf-8")

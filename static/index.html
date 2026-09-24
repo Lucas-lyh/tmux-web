@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
 <title>tmux web</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
+<link rel="stylesheet" href="/static/vendor/xterm-5.3.0/xterm.min.css">
 <style>
   :root {
     --bg: #0f1117; --panel: #161a23; --border: #262c3a;
@@ -374,9 +374,9 @@
     </div>
   </div>
 
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+<script src="/static/vendor/chart.js-4.4.1/chart.umd.min.js"></script>
+<script src="/static/vendor/xterm-5.3.0/xterm.min.js"></script>
+<script src="/static/vendor/xterm-addon-fit-0.8.0/xterm-addon-fit.min.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 let current = null, ws = null, term = null, fit = null;
