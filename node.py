@@ -918,6 +918,65 @@ async def _close_writer(writer) -> None:
         await asyncio.wait_for(writer.wait_closed(), 3)
 
 
+class ProxyError(ConnectionError):
+    """Proxy failure with a safe, locally constructed diagnostic."""
+
+
+def node_proxy(u):
+    """Resolve HTTP proxy environment settings without system proxy discovery."""
+    proxies = urllib.request.getproxies_environment()
+    host = f"[{u.hostname}]" if ":" in u.hostname else u.hostname
+    authority = f"{host}:{u.port or 80}"
+    if (urllib.request.proxy_bypass_environment(authority, proxies)
+            or (":" in u.hostname and
+                urllib.request.proxy_bypass_environment(u.hostname, proxies))):
+        return None
+    value = proxies.get("http") or proxies.get("all")
+    if not value:
+        return None
+    try:
+        if (not value.isascii() or any(ord(c) <= 32 or ord(c) == 127 for c in value)
+                or "\\" in value or "#" in value
+                or re.search(r"%(?![0-9a-fA-F]{2})", value)):
+            raise ValueError
+        proxy = urllib.parse.urlsplit(value)
+        if (proxy.scheme != "http" or not proxy.hostname
+                or not re.fullmatch(r"[A-Za-z0-9._:-]+", proxy.hostname)
+                or proxy.port == 0 or proxy.netloc.endswith(":")
+                or proxy.path not in ("", "/") or proxy.query):
+            raise ValueError
+    except ValueError:
+        raise ProxyError("invalid proxy URL; expected http://[user:password@]host:port") from None
+    return proxy
+
+
+async def proxy_connect(reader, writer, u, proxy):
+    host = f"[{u.hostname}]" if ":" in u.hostname else u.hostname
+    authority = f"{host}:{u.port or 80}"
+    headers = [f"CONNECT {authority} HTTP/1.1", f"Host: {authority}"]
+    if proxy.username is not None:
+        user = urllib.parse.unquote(proxy.username)
+        password = urllib.parse.unquote(proxy.password or "")
+        credentials = base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
+        headers.append(f"Proxy-Authorization: Basic {credentials}")
+    writer.write(("\r\n".join(headers) + "\r\n\r\n").encode("ascii"))
+    try:
+        await writer.drain()
+        response = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 10)
+    except asyncio.TimeoutError:
+        raise ProxyError("proxy CONNECT timed out") from None
+    except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+        raise ProxyError("invalid or incomplete proxy CONNECT response") from None
+    status = re.fullmatch(rb"HTTP/1\.[01] ([0-9]{3})(?: [\x20-\x7e]*)?",
+                          response.split(b"\r\n", 1)[0])
+    if status is None:
+        raise ProxyError("invalid proxy CONNECT status")
+    code = int(status[1])
+    if not 200 <= code < 300:
+        # Never print proxy response text: it can reflect credentials.
+        raise ProxyError(f"proxy CONNECT rejected (HTTP {code})")
+
+
 class Ws:
     """Minimal RFC6455 transport; NodeConnection encrypts all application data."""
 
@@ -933,13 +992,19 @@ class Ws:
     async def connect(cls, url: str) -> "Ws":
         u = validate_server_url(url)
         port = u.port or 80
+        proxy = node_proxy(u)
         writer = None
         try:
             try:
                 reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(u.hostname, port), 10)
+                    asyncio.open_connection(proxy.hostname if proxy else u.hostname,
+                                            (proxy.port or 80) if proxy else port), 10)
             except asyncio.TimeoutError:
+                if proxy:
+                    raise ProxyError("proxy TCP connection timed out") from None
                 raise ConnectionError("node TCP connection timed out") from None
+            if proxy:
+                await proxy_connect(reader, writer, u, proxy)
             key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
             path = (u.path or "/") + ("?" + u.query if u.query else "")
             host = f"[{u.hostname}]" if ":" in u.hostname else u.hostname
@@ -1340,12 +1405,14 @@ class Agent:
                 self._refresh_node_url()
                 print(f"[node] connecting to {urllib.parse.urlsplit(self.server).hostname} as {self.name!r} ...")
                 raw_ws = await asyncio.wait_for(Ws.connect(
-                    self.node_url), 25)
+                    self.node_url), 40)
                 channel = await NoiseChannel.establish(WsRaw(raw_ws), self.token, initiator=True)
                 self.ws = NodeConnection(raw_ws, channel)
                 await self.serve()
             except CredentialError:
                 print("[node] credential handoff failed; reconnecting with the current credential")
+            except ProxyError as e:
+                print(f"[node] link down: {e}")
             except (WsClosed, ConnectionError, OSError, asyncio.TimeoutError,
                     asyncio.IncompleteReadError) as e:
                 print(f"[node] link down: {type(e).__name__}")
